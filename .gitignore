@@ -1,0 +1,14 @@
+*.pdf
+*.xlsx
+port/stm32g431/MDK-ARM/*/
+*.uvguix.*
+*.zip
+*.uvoptx
+*.dep
+*.lst
+*.map
+*.o
+*.so
+__pycache__/
+.vscode/
+新建*.txt
