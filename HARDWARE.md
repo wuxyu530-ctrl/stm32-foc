@@ -1,6 +1,6 @@
 # B-G431B-ESC1 硬件常数与配置理由
 
-> 目标板：**B-G431B-ESC1**（母板 MB1419-G431CBU6-**C01**，产品标识 `BG431BESC1$AU3`，硅片版本 X）
+> 目标板：**B-G431B-ESC1**（母板 MB1419-G431CBU6-**C01**，产品标识 `BG431BESC1$AU4`，见 §8.1）
 > MCU：**STM32G431CBU6**（UFQFPN48，128 KB Flash，32 KB SRAM，Cortex-M4F @170 MHz）
 > CubeMX 工程：`port/stm32g431/stm32g431.ioc`
 
@@ -389,12 +389,86 @@ void foc_step(foc_ctx_t *ctx);
 - NVIC：`ADC1_2_IRQn` 抢占优先级 0
 - 12 个关键引脚已 Signal Pinning
 
+- TIM4 编码器模式（PB6/PB7 + PB8 EXTI），USART2 921600，PC11 = DBG_PIN
+- 代码生成 + 全部验收项通过（boost/4WS、UCPD 禁用、OPAMP 六项、TIM1 五项、ADC 注入组）
+- Keil 工具链打通，空工程烧录成功
+- git 仓库 + GitHub 远端（main 分支）
+
 **⏳ 待办**
-1. TIM4：霍尔（Hall Sensor Mode）或编码器（Encoder Mode），PB6/PB7/PB8
-2. USART2：PB3/PB4，921600
-3. PC11 配成 GPIO_Output（调试观测脚）
-4. Project Manager：勾 "Generate peripheral initialization as a pair of .c/.h files"
-5. 生成代码，验证 `SystemClock_Config()` 里有 boost + FLASH_LATENCY_4，`MX_OPAMP1_Init()` 六项参数，`HAL_PWREx_DisableUCPDDeadBattery()`
-6. `git init`（`.gitignore` 排除 PDF）
-7. 搭 `core/` 骨架 + SVPWM 单元测试（不需要硬件）
-8. Python 仿真台架
+1. **拆掉 MT6701 的 MODE 焊桥**，恢复 ABZ 模式
+2. OUT1/2/3 焊排针，电机杜邦母口直插
+3. **M1：空跑 PWM 验证**（USB + J5/J6 接 12V 限流 0.5A，不接电机）→ 示波器验证互补输出、死区 ≈1 µs、上下管无重叠
+4. **M1.5：`core/` 骨架 + 单元测试**（PC 上跑，不需要硬件）
+5. M2 开环 SVPWM 上板
+6. M3 电流采样验证（`ia+ib+ic≈0`），实测振铃时间 → 标定 CCR4 与 d_max
+7. M4 编码器验证 + 电机参数辨识（L、R）
+8. M5/M6 Simulink MIL + C Caller SIL
+9. M7 电流环闭合
+
+---
+
+## 8. 实物确认（2026-09-02，硬件到货）
+
+### 8.1 板子
+
+| 项 | 实测 | 说明 |
+|---|---|---|
+| 包装标识 | `BG431BESC1$AU4` | 比 UM2516 Rev4 记录的 AU1~AU3 更新 |
+| **二维码 / PCB 丝印** | **`MB1419-G431CBU6-C01`** | **母板是 C01 → 我们下载的 C01 原理图完全适用** |
+| 序列号 | A262301325 | |
+| MCU 丝印 | `STM32G 431CBU6 / GQ2C213YA / CHN GQ 610` | QFN48 |
+| **采样电阻丝印** | **`003`**（R54/R55/R56） | **实物确认 3 mΩ** |
+| 栅极驱动 | U10/U11/U13 = `L6387D` | |
+| MOSFET | Q2~Q7 | |
+
+> `$AU4` 只是产品标识/硅片批次更新，母板仍是 C01，配置无需改动。
+
+### 8.2 连接器对照（UM2516 §5.3 + 实物）
+
+| 标号 | 用途 | 形态 |
+|---|---|---|
+| **J5+ / J6** | **母线电源输入（+ / GND）** | 板子边缘大焊盘 |
+| **OUT1 / OUT2 / OUT3** | 电机三相输出 | **大镀金焊盘，各一个孔** → 焊排针最方便 |
+| **J8 / HALL** | 编码器/霍尔（供电 **5 V**） | 5 个平面焊盘（DNF） |
+| J2 (U4) | micro-USB，烧录+调试+虚拟串口 | 子板上 |
+| J3 | PWM 输入 / UART / BEC 5V 输出 | 主板顶面焊盘 |
+| J1 | CAN | |
+| J4 | SWD（掰掉子板后用） | |
+| TP2 / TP3 | 测试点（PC11 / OPAMP3_OUT），均 DNF | 需飞线 |
+
+**⚠️ 只插 USB 时，MCU 会运行、TIM1 会输出 PWM 信号，但 +10V 栅极驱动电源来自母线经 buck（U9+L2），所以 MOSFET 不会开关，OUT 焊盘量不到波形。测 PWM 必须接 J5+/J6。**
+
+### 8.3 电机与传感器
+
+| 项 | 值 |
+|---|---|
+| 电机 | **GM2804 云台电机，7 对极** |
+| 相引线 | 3 根，杜邦母口（红/白/黑） |
+| 编码器 | **MT6701**，差分霍尔，ABZ **1024 线**（×4 = 4096 counts/圈） |
+| 编码器精度 | ±0.75°（机械）→ 7 对极下 **5.25° 电角度误差** |
+| 编码器系统延时 | 5 µs |
+| **MODE 焊桥** | ⚠️ **出厂被短接成 I2C/SSI 模式，必须去掉焊锡恢复 ABZ** |
+| 编码器接口（丝印） | `VCC / Z / B_SCL / A_SDA / GND` — ABZ 与 I2C 共用同一排针 |
+
+**MODE 电路**：`+5V —[R5 0Ω/焊桥]— MODE —[R2 10kΩ]— GND`
+去掉焊桥后 MODE 被 R2 下拉为低 = ABZ。**只需拆锡，不需加锡，几乎不可能搞砸。**
+验证：MODE↔GND ≈ 10 kΩ，MODE↔VCC 开路。
+
+### 8.4 测试设备
+
+| 设备 | 型号/规格 |
+|---|---|
+| 电源 | **RD6006**（60 V / 6 A，可编程 CC 限流） |
+| 示波器 | **4 通道** |
+| 调试器 | 板载 **ST-LINK/V2-1**，FW `V2J46M32` |
+
+### 8.5 工具链（已验证）
+
+| 项 | 状态 |
+|---|---|
+| Keil MDK | **5.43a**，AC6 编译器 |
+| `uAC6=1` / `RvdsVP=2` / `Optim=3` | AC6 / 单精度 FPU / -O2 **均已生效** |
+| ST-Link 驱动 | 来自 `%LOCALAPPDATA%\Keil_v5\ARM\STLink\USBDriver\stlink_winusb_install.bat`（需管理员运行） |
+| 空工程占用 | Flash **15.3 KB / 128 KB**，RAM **3.3 KB / 32 KB** |
+| 烧录 | ✅ Erase / Program / Verify 全通过 |
+| 编辑环境 | VS Code (WSL Remote) 编辑 + git；Keil 仅编译烧录 |
