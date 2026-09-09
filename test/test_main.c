@@ -7,6 +7,7 @@ int g_fail_count = 0;
 
 /* 各测试组的入口（定义在对应的 test_*.c 里） */
 void test_transform_all(void);
+void test_svpwm_all(void);
 
 static void test_sanity(void)
 {
@@ -18,6 +19,7 @@ int main(void)
 {
     RUN_TEST(test_sanity);
     test_transform_all();
+    test_svpwm_all();
 
     printf("\n===== %d 项检查，%d 项失败 =====\n",
             g_test_count, g_fail_count);
