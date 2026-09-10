@@ -69,9 +69,98 @@ bool foc_svpwm(const foc_ab_t *u_ab, float vdc, float d_max, foc_abc_t *duty)
      *
      * 实现方法 A（扇区+作用时间）或 B（min-max 注入）都可以，见 svpwm.h §5。
      */
-    (void)u_ab; (void)vdc; (void)d_max;
-    duty->a = 0.5f;
-    duty->b = 0.5f;
-    duty->c = 0.5f;
-    return false;
+    float t1,t2,dutymax,k;
+
+    /* 六个基本矢量的 (α, β) 分量，推导 switch 里各扇区系数时的依据。
+     * 系数已展开写死在下面各 case 中，此表仅作注释保留：
+     *     V1 = ( 2/3·vdc,          0        )   mos 100
+     *     V2 = ( 1/3·vdc,  1/√3·vdc)          mos 110
+     *     V3 = (-1/3·vdc,  1/√3·vdc)          mos 010
+     *     V4 = (-2/3·vdc,          0        )   mos 011
+     *     V5 = (-1/3·vdc, -1/√3·vdc)          mos 001
+     *     V6 = ( 1/3·vdc, -1/√3·vdc)          mos 101
+     * 六个矢量模长均为 2/3·vdc，互隔 60°。 */
+
+    uint8_t Sectors = foc_svpwm_sector(u_ab);
+    
+    switch(Sectors){
+        case 1:
+            t2 = FOC_SQRT3*u_ab->beta/vdc;
+            t1 = 0.5f*(3*u_ab->alpha - FOC_SQRT3*u_ab->beta)/vdc;
+            duty->a = 0.5f*(1+t1+t2);
+            duty->b = 0.5f*(1-t1+t2);
+            duty->c = 0.5f*(1-t1-t2);
+            break;
+
+        case 2:
+            t1 = FOC_SQRT3_2*(FOC_SQRT3*u_ab->alpha+u_ab->beta)/vdc;
+            t2 = FOC_SQRT3_2*(u_ab->beta-FOC_SQRT3*u_ab->alpha)/vdc;
+            duty->a = 0.5f*(1+t1-t2);
+            duty->b = 0.5f*(1+t1+t2);
+            duty->c = 0.5f*(1-t1-t2);
+            break;
+
+        case 3:
+            t1 = FOC_SQRT3*u_ab->beta/vdc;
+            t2 = -0.5f*(FOC_SQRT3*u_ab->beta+3*u_ab->alpha)/vdc;
+            duty->a = 0.5f*(1-t1-t2);
+            duty->b = 0.5f*(1+t1+t2);
+            duty->c = 0.5f*(1-t1+t2);
+            break;
+
+        case 4:
+            t2 = -FOC_SQRT3*u_ab->beta/vdc;
+            t1 = 0.5f*(FOC_SQRT3*u_ab->beta-3*u_ab->alpha)/vdc;
+            duty->a = 0.5f*(1-t1-t2);
+            duty->b = 0.5f*(1+t1-t2);
+            duty->c = 0.5f*(1+t1+t2);
+
+            break;
+
+        case 5:
+            t1 = -FOC_SQRT3_2*(FOC_SQRT3*u_ab->alpha+u_ab->beta)/vdc;
+            t2 = FOC_SQRT3_2*(FOC_SQRT3*u_ab->alpha-u_ab->beta)/vdc;
+            duty->a = 0.5f*(1+t2-t1);
+            duty->b = 0.5f*(1-t1-t2);
+            duty->c = 0.5f*(1+t1+t2);
+            break;
+
+        case 6:
+            t1 = -FOC_SQRT3*u_ab->beta/vdc;
+            t2 = 0.5f*(FOC_SQRT3*u_ab->beta+3*u_ab->alpha)/vdc;
+            duty->a = 0.5f*(1+t1+t2);
+            duty->b = 0.5f*(1-t1-t2);
+            duty->c = 0.5f*(1+t1-t2);
+            break;
+        default:
+            /* foc_svpwm_sector() 只会返回 1~6，正常走不到这里。
+             * 但一旦走到，duty 会是未初始化的栈垃圾并被直接写进 CCR，
+             * 因此兜底成三相同电位（等效零矢量，电机不受激励），
+             * 并返回 true 通知电流环停止积分。 */
+            duty->a = 0.5f;
+            duty->b = 0.5f;
+            duty->c = 0.5f;
+            return true;
+    }
+
+    /*限幅占空比，确保当目标矢量超出边界（六边形边界），具体表现是t1+t2>1，或者说某一相的占空比大于1或某一相的占空比小于0时，可以正常的保证方向的同时缩放回边界内，确保在输出能力内，避免钳位*/
+    dutymax = fmaxf(duty->a, fmaxf(duty->b, duty->c));/*C 标准库没有三参数的 max，math.h 提供的是两参数的 fmaxf（float 版），嵌套取三相最大*/
+    /*下面只考虑dutymax>1的情况，不用再考虑dutymin<0的情况，原因是因为我们的mos状态是七段式变化的，满足零矢量均分，天然的存在dutymax+dutymin=1的等式，于是dutymax>1等价于dutymin<0*/
+    if(dutymax > d_max)
+    {
+        k = (d_max-0.5f)/(dutymax-0.5f);/*系数这么算，不直接用d_max/dmax，是因为我们占空比的本质是两种不同mos状态维持的时间，我们三相的占空比都是0.5+系数*维持时间来的*/
+        /*我们要生成某个方向的矢量，实际上是根据V1 V2的维持时间来生成的，实际上本来的系数kt应该等于 kt = t_max/(t1+t2),然后t1new=kt*t1 t2new=kt*t2*/
+        /*代回da db dc，会发现kt = (da新-0.5)/(da-0.5) ,所以系数是这么来的*/
+        /*一个更强力的解释是，在扇区内t1 t2都是有关U的线性函数，所以实际上这里svpwm限幅后的输出，就等于拿kU去跑一遍svpwm，实际上把目标矢量缩短到k倍就完全等价于时间缩短k倍，于是也就能得出占空比算出的比例系数*/
+        duty->a = 0.5f+k*(duty->a-0.5f);
+        duty->b = 0.5f+k*(duty->b-0.5f);
+        duty->c = 0.5f+k*(duty->c-0.5f);
+
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+
 }

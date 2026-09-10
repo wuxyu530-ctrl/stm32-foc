@@ -133,11 +133,23 @@ static void test_svpwm_linear_boundary(void)
 /* ======================================================================== */
 static void test_svpwm_dmax_clamp(void)
 {
-    const float DMAX = 0.94f;
+    /* DMAX 必须选在 0.93301 以下，否则本测试会误判。
+     *
+     * 原因：内切圆 |U| = Vdc/√3 上，max(d) 并非常数，而是随扇区内角度 θ 摆动
+     *       max(d) = 0.5 + (sin(60°-θ) + sin θ) / 2
+     *         θ = 30°（扇区正中，内切圆切点）  → max(d) = 1.00000
+     *         θ =  0°/60°（扇区边界方向）      → max(d) = 0.93301
+     *       即 max(d) ∈ [0.93301, 1.0]。
+     *
+     * 换句话说 max(d) <= d_max 划出的是一个"缩小的六边形"而不是圆：
+     * 若取 DMAX = 0.94，靠近扇区边界的那几段圆弧本来就落在六边形内部，
+     * 不该限幅，foc_svpwm 会如实返回 false —— 那是正确行为，不是 bug。
+     * 取 0.90 才能保证整圈每个角度都必然越界，从而真正验到限幅逻辑。 */
+    const float DMAX = 0.90f;
 
     for (int k = 0; k < NPTS; k++) {
         float th = (float)k * FOC_2PI / (float)NPTS;
-        foc_ab_t  u = { ULIM * cosf(th), ULIM * sinf(th) };   /* 必然超 0.94 */
+        foc_ab_t  u = { ULIM * cosf(th), ULIM * sinf(th) };   /* 必然超 0.90 */
         foc_abc_t d;
 
         bool sat = foc_svpwm(&u, VDC, DMAX, &d);
