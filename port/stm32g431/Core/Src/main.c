@@ -26,6 +26,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "svpwm.h"
+#include "transform.h"
 
 /* USER CODE END Includes */
 
@@ -36,7 +38,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* M1a：固定占空比空跑 PWM，万用表 DC 档在 OUT1/2/3 上应读 M1A_DUTY × Vbus。
+ * 三次分别烧 0.25 / 0.50 / 0.75，三点应在一条过原点的直线上。 */
+#define M1A_DUTY   0.75f
+#define TIM1_ARR   4250u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -99,7 +104,24 @@ int main(void)
   MX_TIM4_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  {
+    uint32_t ccr = (uint32_t)(M1A_DUTY * TIM1_ARR + 0.5f);
 
+    /* 先写 CCR 再开输出。三相同占空比 → 相间电压为零，即使误接电机也不会动 */
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr);
+
+    HAL_Delay(3000);                              /* 上电 3 s 后再开，留时间看静态电流 */
+
+    HAL_TIM_PWM_Start  (&htim1, TIM_CHANNEL_1);   /* CHx  = 上管 */
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);  /* CHxN = 下管（互补 + 死区） */
+    HAL_TIM_PWM_Start  (&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start  (&htim1, TIM_CHANNEL_3);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+    /* TIM1 是高级定时器，HAL_TIM_PWM_Start 内部会置 MOE，不必手动开 */
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */

@@ -12,3 +12,6 @@ port/stm32g431/MDK-ARM/*/
 __pycache__/
 .vscode/
 新建*.txt
+build/
+*.log
+*.scvd
