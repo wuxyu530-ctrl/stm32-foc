@@ -26,9 +26,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <math.h>
 #include "svpwm.h"
 #include "transform.h"
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,10 +38,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* M1a：固定占空比空跑 PWM，万用表 DC 档在 OUT1/2/3 上应读 M1A_DUTY × Vbus。
- * 三次分别烧 0.25 / 0.50 / 0.75，三点应在一条过原点的直线上。 */
-#define M1A_DUTY   0.75f
 #define TIM1_ARR   4250u
+
+/* M2：开环 SVPWM。每 1 ms 电角度前进一步，U_dq = (0, U_AMP) 经逆 Park → SVPWM → CCR。
+ * 电机像步进电机一样跟随旋转磁场，不需要编码器和电流采样。
+ *   M2_U_AMP   相电压幅值 [V]（幅值不变约定）。GM2804 相电阻约几欧，1 V 对应零点几安
+ *   M2_F_ELEC  电角频率 [Hz]。7 对极 → 机械转速 = F_ELEC / 7 圈/秒
+ *   M2_VDC     暂用固定 12 V，M3 之后改为 ADC 实测 */
+#define M2_VDC     12.0f
+#define M2_U_AMP   2.5f
+#define M2_F_ELEC  30.0f
+#define M2_DMAX    0.956f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,7 +70,13 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+/* 把三相占空比写进 TIM1 CCR1~3（预装载使能，实际在下一个更新事件生效） */
+static void pwm_set_duty(const foc_abc_t *d)
+{
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)(d->a * TIM1_ARR + 0.5f));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)(d->b * TIM1_ARR + 0.5f));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)(d->c * TIM1_ARR + 0.5f));
+}
 /* USER CODE END 0 */
 
 /**
@@ -105,12 +118,9 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   {
-    uint32_t ccr = (uint32_t)(M1A_DUTY * TIM1_ARR + 0.5f);
-
-    /* 先写 CCR 再开输出。三相同占空比 → 相间电压为零，即使误接电机也不会动 */
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr);
+    /* 先输出零矢量（三相 0.5），再开 PWM；此时相间电压为零，电机不动 */
+    const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+    pwm_set_duty(&zero);
 
     HAL_Delay(3000);                              /* 上电 3 s 后再开，留时间看静态电流 */
 
@@ -131,6 +141,27 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    {
+      static uint32_t last_ms = 0;
+      static float    theta   = 0.0f;              /* 电角度 [rad] */
+      uint32_t now = HAL_GetTick();
+
+      if (now != last_ms) {                        /* 1 kHz 更新 */
+        last_ms = now;
+
+        theta += FOC_2PI * M2_F_ELEC * 0.001f;
+        if (theta >= FOC_2PI) theta -= FOC_2PI;
+
+        foc_sincos_t sc  = { sinf(theta), cosf(theta) };
+        foc_dq_t     udq = { 0.0f, M2_U_AMP };     /* 纯 q 轴电压 → 旋转矢量 */
+        foc_ab_t     uab;
+        foc_abc_t    duty;
+
+        foc_inv_park(&udq, &sc, &uab);
+        foc_svpwm(&uab, M2_VDC, M2_DMAX, &duty);
+        pwm_set_duty(&duty);
+      }
+    }
   }
   /* USER CODE END 3 */
 }
