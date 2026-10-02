@@ -42,7 +42,14 @@
 /* 当前跑哪个实验。改这一行再编译烧录即可切换。 */
 #define APP_M2_OPENLOOP    1   /* 开环 SVPWM 拖电机转 */
 #define APP_M4A_ENCODER    2   /* 不开 PWM，手转电机，串口看编码器读数 */
-#define APP_MODE           APP_M4A_ENCODER
+#define APP_M4A2_CALIB     3   /* d 轴对齐 + 慢速拖转，测极对数、电角度零点、方向 */
+#define APP_MODE           APP_M4A2_CALIB
+
+/* M4a-2 标定参数 */
+#define CAL_U_ALIGN        1.0f   /* d 轴电压 [V]。GM2804 相电阻几欧，1 V 约零点几安 */
+#define CAL_F_ELEC         1.0f   /* 拖转电频率 [Hz]：每秒一整圈电角度，足够慢，转子精确跟随 */
+#define CAL_N_ELEC_REVS    14     /* 拖多少圈电角度。7 对极 → 两圈机械 */
+#define ENC_CPR            4096   /* 编码器每圈计数：1024 线 × 4 */
 
 #define TIM1_ARR   4250u
 
@@ -70,6 +77,7 @@
  * 每次都老老实实去内存里读，不许把它缓存在寄存器里或者优化掉。 */
 static volatile uint32_t g_enc_z_count  = 0;   /* Z 脉冲累计次数（每转一圈 +1） */
 static volatile uint32_t g_enc_cnt_at_z = 0;   /* 最近一次 Z 脉冲到来时 TIM4 的计数值 */
+static int32_t           g_enc_pos      = 0;   /* 上电以来的累计位置 [count]，处理了回绕，可正可负 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,12 +106,54 @@ int fputc(int ch, FILE *f)
     return ch;
 }
 
+/* 读 TIM4，把 0~4095 的回绕计数展开成连续的累计位置 g_enc_pos。
+ * 前提：两次调用之间转过的角度小于半圈（2048 count）。1 ms 调一次时，对应 < 30000 rpm，绰绰有余。 */
+static void enc_update(void)
+{
+    static uint32_t last = 0;
+    static int      init = 0;
+    uint32_t cnt = __HAL_TIM_GET_COUNTER(&htim4);
+    if (!init) { last = cnt; init = 1; }
+    int32_t d = (int32_t)cnt - (int32_t)last;
+    if (d >  ENC_CPR / 2) d -= ENC_CPR;
+    if (d < -ENC_CPR / 2) d += ENC_CPR;
+    g_enc_pos += d;
+    last = cnt;
+}
+
+/* 在电角度 theta 方向上施加电压矢量 (Ud, Uq)，写 CCR */
+static void apply_udq(float ud, float uq, float theta);
+
 /* 把三相占空比写进 TIM1 CCR1~3（预装载使能，实际在下一个更新事件生效） */
 static void pwm_set_duty(const foc_abc_t *d)
 {
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)(d->a * TIM1_ARR + 0.5f));
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)(d->b * TIM1_ARR + 0.5f));
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)(d->c * TIM1_ARR + 0.5f));
+}
+
+static void apply_udq(float ud, float uq, float theta)
+{
+    foc_sincos_t sc  = { sinf(theta), cosf(theta) };
+    foc_dq_t     udq = { ud, uq };
+    foc_ab_t     uab;
+    foc_abc_t    duty;
+    foc_inv_park(&udq, &sc, &uab);
+    foc_svpwm(&uab, M2_VDC, M2_DMAX, &duty);
+    pwm_set_duty(&duty);
+}
+
+/* 开 PWM（先零矢量），供需要驱动电机的模式共用 */
+static void pwm_start_zero(void)
+{
+    const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+    pwm_set_duty(&zero);
+    HAL_TIM_PWM_Start  (&htim1, TIM_CHANNEL_1);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start  (&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start  (&htim1, TIM_CHANNEL_3);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
 }
 /* USER CODE END 0 */
 
@@ -174,6 +224,28 @@ int main(void)
   }
   printf("M4a: turn the motor by hand. 1 rev should be 4096 counts and 1 Z pulse.\r\n");
 
+#elif APP_MODE == APP_M4A2_CALIB
+  HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+  printf("M4a-2: align + slow sweep. U=%.2f V, f=%.1f Hz, %d elec revs\r\n",
+         (double)CAL_U_ALIGN, (double)CAL_F_ELEC, CAL_N_ELEC_REVS);
+  printf("PWM starts in 3 s ...\r\n");
+  HAL_Delay(3000);
+  pwm_start_zero();
+
+  /* ① 对齐。先拉到 90°，再拉到 0°：
+   *    如果转子恰好停在和 0° 相差 180° 的位置，直接拉 0° 时两边力矩抵消，可能卡住不动；
+   *    先去 90° 再回 0°，就不会落在那个不稳定点上。 */
+  apply_udq(CAL_U_ALIGN, 0.0f, FOC_PI / 2.0f);
+  HAL_Delay(500);
+  apply_udq(CAL_U_ALIGN, 0.0f, 0.0f);
+  HAL_Delay(1000);                               /* 等转子停稳 */
+
+  enc_update();
+  {
+    uint32_t cnt0 = __HAL_TIM_GET_COUNTER(&htim4);
+    printf("ALIGN theta_e=0  ->  enc cnt=%lu  pos=%ld\r\n",
+           (unsigned long)cnt0, (long)g_enc_pos);
+  }
 #endif
   /* USER CODE END 2 */
 
@@ -232,6 +304,48 @@ int main(void)
                (double)pos / 4096.0,
                (unsigned long)g_enc_z_count,
                (unsigned long)g_enc_cnt_at_z);
+      }
+    }
+#elif APP_MODE == APP_M4A2_CALIB
+    {
+      static uint32_t last_ms   = 0;
+      static float    theta     = 0.0f;
+      static int      rev       = 0;               /* 已走完的电角度整圈数 */
+      static int32_t  pos_start = 0;
+      static int32_t  pos_prev  = 0;
+      static int      done      = 0;
+      uint32_t now = HAL_GetTick();
+
+      if (!done && now != last_ms) {               /* 1 kHz */
+        last_ms = now;
+        enc_update();
+        if (rev == 0 && theta == 0.0f) { pos_start = g_enc_pos; pos_prev = g_enc_pos; }
+
+        theta += FOC_2PI * CAL_F_ELEC * 0.001f;
+        if (theta >= FOC_2PI) {                    /* 走完一整圈电角度 */
+          theta -= FOC_2PI;
+          rev++;
+          int32_t step = g_enc_pos - pos_prev;     /* 这一圈电角度对应的编码器计数 */
+          pos_prev = g_enc_pos;
+          printf("elec rev %2d: pos=%7ld  step=%+6ld  cnt=%4lu\r\n",
+                 rev, (long)g_enc_pos, (long)step,
+                 (unsigned long)__HAL_TIM_GET_COUNTER(&htim4));
+        }
+        apply_udq(CAL_U_ALIGN, 0.0f, theta);       /* d 轴电压：转子磁极正对 theta */
+
+        if (rev >= CAL_N_ELEC_REVS) {
+          done = 1;
+          const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+          pwm_set_duty(&zero);                     /* 结束：回零矢量，电机不再受力 */
+
+          float per_rev = (float)(g_enc_pos - pos_start) / (float)CAL_N_ELEC_REVS;
+          printf("---- RESULT ----\r\n");
+          printf("counts per elec rev = %.1f\r\n", (double)per_rev);
+          printf("pole pairs          = %.3f  (4096 / |counts per elec rev|)\r\n",
+                 (double)((float)ENC_CPR / fabsf(per_rev)));
+          printf("direction           = %s\r\n",
+                 per_rev > 0 ? "+1 (theta_e up -> count up)" : "-1 (theta_e up -> count DOWN)");
+        }
       }
     }
 #endif
