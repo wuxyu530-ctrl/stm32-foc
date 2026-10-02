@@ -45,7 +45,8 @@
 #define APP_M4A_ENCODER    2   /* 不开 PWM，手转电机，串口看编码器读数 */
 #define APP_M4A2_CALIB     3   /* d 轴对齐 + 慢速拖转，测极对数、电角度零点、方向 */
 #define APP_M3_CURRENT     4   /* 电流采样：零点标定 → 直流矢量验符号 → 开环转动看三相波形 */
-#define APP_MODE           APP_M3_CURRENT
+#define APP_M4B_RES        5   /* 测相电阻：锁转子，多个直流电压点线性拟合 U = R·I + U0 */
+#define APP_MODE           APP_M4B_RES
 
 /* M3 电流采样参数 */
 #define M3_U_DC            1.5f   /* 直流矢量测试电压 [V] */
@@ -53,6 +54,10 @@
 #define M3_F_ROT           5.0f   /* 开环转动电频率 [Hz] */
 #define M3_I_TRIP          2.0f   /* 软件过流保护阈值 [A]：任一相超过即关 PWM */
 #define PWM_HZ             20000.0f
+
+/* M4b 测电阻参数 */
+#define M4B_N_PTS          4
+static const float M4B_U[M4B_N_PTS] = { 0.6f, 1.0f, 1.4f, 1.8f };   /* d 轴电压 [V] */
 
 /* M4a-2 标定参数 */
 #define CAL_U_ALIGN        1.0f   /* d 轴电压 [V]。GM2804 相电阻几欧，1 V 约零点几安 */
@@ -232,6 +237,18 @@ static void avg_currents(uint32_t n, float out[3], float *pp_a)
   if (pp_a) *pp_a = g_avg_max - g_avg_min;
 }
 
+/* 把三相电流投影到电角度 theta 方向（即 Park 变换的 d 分量）*/
+static float i_along(const float abc[3], float theta)
+{
+  foc_abc_t    i  = { abc[0], abc[1], abc[2] };
+  foc_ab_t     ab;
+  foc_sincos_t sc = { sinf(theta), cosf(theta) };
+  foc_dq_t     dq;
+  foc_clarke(&i, &ab);
+  foc_park(&ab, &sc, &dq);
+  return dq.d;
+}
+
 static void print_avg(const char *tag, uint32_t n)
 {
   float a[3], pp;
@@ -382,6 +399,55 @@ int main(void)
     HAL_Delay(5000);
     g_ctl_ud = 0.0f; g_ctl_uq = M3_U_ROT; g_ctl_f = M3_F_ROT; g_ctl_theta = 0.0f;
     g_ctl_mode = CTL_ROTATE;
+  }
+
+#elif APP_MODE == APP_M4B_RES
+  printf("M4b: phase resistance by multi-point fit  U = R*I + U0\r\n");
+  cs_init();
+  __HAL_TIM_ENABLE(&htim1);
+  HAL_Delay(100);
+  if (!cs_calibrate_offset(4000)) printf("!! offset calibration suspicious\r\n");
+  pwm_start_zero();
+  HAL_Delay(300);
+
+  {
+    const float  th[3]  = { 0.0f, FOC_2PI / 3.0f, 2.0f * FOC_2PI / 3.0f };
+    const char   axn[3] = { 'A', 'B', 'C' };
+    float        r_axis[3] = { 0 };
+
+    for (int k = 0; k < 3 && !g_fault; k++) {
+      float sx = 0, sy = 0, sxx = 0, sxy = 0;      /* 最小二乘：x = 电流 I，y = 电压 U */
+      printf("-- axis %c --\r\n", axn[k]);
+
+      /* 先用最小电压把转子拉到这个方向，停稳 */
+      g_ctl_ud = M4B_U[0]; g_ctl_uq = 0.0f; g_ctl_theta = th[k];
+      g_ctl_mode = CTL_HOLD;
+      HAL_Delay(600);
+
+      for (int n = 0; n < M4B_N_PTS && !g_fault; n++) {
+        g_ctl_ud = M4B_U[n];
+        HAL_Delay(300);                            /* 电流在 L/R 的几倍时间内稳定，300 ms 足够 */
+        float abc[3];
+        avg_currents(8000, abc, NULL);             /* 0.4 s 平均，压掉 ±4 LSB 的单点噪声 */
+        float id = i_along(abc, th[k]);
+        printf("   U=%.2f V   I=%.4f A   (ia %+.3f ib %+.3f ic %+.3f)\r\n",
+               (double)M4B_U[n], (double)id, (double)abc[0], (double)abc[1], (double)abc[2]);
+        sx += id; sy += M4B_U[n]; sxx += id * id; sxy += id * M4B_U[n];
+      }
+      float N  = (float)M4B_N_PTS;
+      float R  = (N * sxy - sx * sy) / (N * sxx - sx * sx);   /* 斜率 */
+      float U0 = (sy - R * sx) / N;                           /* 截距 */
+      r_axis[k] = R;
+      printf("   => R = %.3f ohm,  U0 = %.3f V (dead-time etc.)\r\n", (double)R, (double)U0);
+    }
+    g_ctl_mode = CTL_IDLE;
+    const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+    pwm_set_duty(&zero);
+
+    if (g_fault) printf("!! OVERCURRENT TRIP\r\n");
+    else printf("---- RESULT ----\r\nR_phase = %.3f ohm  (A %.3f / B %.3f / C %.3f)\r\n",
+                (double)((r_axis[0] + r_axis[1] + r_axis[2]) / 3.0f),
+                (double)r_axis[0], (double)r_axis[1], (double)r_axis[2]);
   }
 #endif
   /* USER CODE END 2 */
