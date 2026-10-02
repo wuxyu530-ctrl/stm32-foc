@@ -46,7 +46,8 @@
 #define APP_M4A2_CALIB     3   /* d 轴对齐 + 慢速拖转，测极对数、电角度零点、方向 */
 #define APP_M3_CURRENT     4   /* 电流采样：零点标定 → 直流矢量验符号 → 开环转动看三相波形 */
 #define APP_M4B_RES        5   /* 测相电阻：锁转子，多个直流电压点线性拟合 U = R·I + U0 */
-#define APP_MODE           APP_M4B_RES
+#define APP_M4C_IND        6   /* 测电感：d 轴电压阶跃，重复叠加平均，输出电流波形供拟合 τ = L/R */
+#define APP_MODE           APP_M4C_IND
 
 /* M3 电流采样参数 */
 #define M3_U_DC            1.5f   /* 直流矢量测试电压 [V] */
@@ -58,6 +59,15 @@
 /* M4b 测电阻参数 */
 #define M4B_N_PTS          4
 static const float M4B_U[M4B_N_PTS] = { 0.6f, 1.0f, 1.4f, 1.8f };   /* d 轴电压 [V] */
+
+/* M4c 测电感参数 */
+#define M4C_U_LO           0.4f   /* 阶跃前 d 轴电压 [V]：保持转子对齐 */
+#define M4C_U_HI           1.8f   /* 阶跃后 [V] */
+#define M4C_PERIOD         400    /* 一个高低周期的 PWM 周期数：400 × 50 µs = 20 ms */
+#define M4C_STEP_AT        200    /* 第 200 个周期电压从 LO 跳到 HI */
+#define M4C_PRE            10     /* 记录阶跃前 10 个点作基线 */
+#define M4C_LEN            190    /* 共记录 190 个点（9.5 ms） */
+#define M4C_REPEAT         128    /* 重复叠加次数：噪声降为 1/sqrt(128) ≈ 1/11 */
 
 /* M4a-2 标定参数 */
 #define CAL_U_ALIGN        1.0f   /* d 轴电压 [V]。GM2804 相电阻几欧，1 V 约零点几安 */
@@ -107,6 +117,12 @@ static volatile int        g_fault     = 0;         /* 过流跳闸后置 1 */
 static volatile uint32_t   g_avg_left  = 0;
 static volatile float      g_avg_sum[3];
 static volatile float      g_avg_min, g_avg_max;    /* a 相的最小/最大值，看噪声 */
+
+/* M4c 阶跃叠加 */
+static volatile int        g_step_run  = 0;         /* 1：中断里执行阶跃并累加 */
+static volatile uint32_t   g_step_n    = 0;         /* 当前在周期内的第几个 PWM 周期 */
+static volatile uint32_t   g_step_rep  = 0;         /* 已完成的重复次数 */
+static float               g_step_sum[M4C_LEN];     /* 每个采样点 id 的累加和 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -204,6 +220,21 @@ void cs_on_sample(const foc_abc_t *i)
     if (i->a < g_avg_min) g_avg_min = i->a;
     if (i->a > g_avg_max) g_avg_max = i->a;
     g_avg_left--;
+  }
+
+  if (g_step_run) {
+    /* θ = 0 时 d 轴就是 α 轴：id = iα = (2/3)·(ia − (ib + ic)/2) */
+    float id = FOC_2_3 * (i->a - 0.5f * (i->b + i->c));
+    uint32_t n = g_step_n;
+    if (n >= M4C_STEP_AT - M4C_PRE && n < M4C_STEP_AT - M4C_PRE + M4C_LEN)
+      g_step_sum[n - (M4C_STEP_AT - M4C_PRE)] += id;
+    /* 这一周期算出的占空比要等下一个更新事件才生效，所以第 n 个样本看到的是第 n-1 次写入的电压 */
+    g_ctl_ud = (n < M4C_STEP_AT) ? M4C_U_LO : M4C_U_HI;
+    if (++n >= M4C_PERIOD) {
+      n = 0;
+      if (++g_step_rep >= M4C_REPEAT) { g_step_run = 0; g_ctl_ud = M4C_U_LO; }
+    }
+    g_step_n = n;
   }
 
   switch (g_ctl_mode) {
@@ -448,6 +479,40 @@ int main(void)
     else printf("---- RESULT ----\r\nR_phase = %.3f ohm  (A %.3f / B %.3f / C %.3f)\r\n",
                 (double)((r_axis[0] + r_axis[1] + r_axis[2]) / 3.0f),
                 (double)r_axis[0], (double)r_axis[1], (double)r_axis[2]);
+  }
+
+#elif APP_MODE == APP_M4C_IND
+  printf("M4c: inductance by d-axis voltage step %.2f -> %.2f V, %d repeats\r\n",
+         (double)M4C_U_LO, (double)M4C_U_HI, M4C_REPEAT);
+  cs_init();
+  __HAL_TIM_ENABLE(&htim1);
+  HAL_Delay(100);
+  if (!cs_calibrate_offset(4000)) printf("!! offset calibration suspicious\r\n");
+  pwm_start_zero();
+  HAL_Delay(300);
+
+  /* 转子对齐到 θ = 0：先 90° 再 0°，避开 180° 不稳定点 */
+  g_ctl_ud = M4C_U_LO; g_ctl_uq = 0.0f; g_ctl_theta = FOC_PI / 2.0f; g_ctl_mode = CTL_HOLD;
+  HAL_Delay(400);
+  g_ctl_theta = 0.0f;
+  HAL_Delay(800);
+
+  for (int k = 0; k < M4C_LEN; k++) g_step_sum[k] = 0.0f;
+  g_step_n = 0; g_step_rep = 0; g_step_run = 1;
+  while (g_step_run && !g_fault) { }               /* 128 × 20 ms ≈ 2.6 s */
+
+  g_ctl_mode = CTL_IDLE;
+  {
+    const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+    pwm_set_duty(&zero);
+  }
+  if (g_fault) {
+    printf("!! OVERCURRENT TRIP\r\n");
+  } else {
+    printf("---- STEP (k, t_us, id_A) ; step written at k=%d ----\r\n", M4C_PRE);
+    for (int k = 0; k < M4C_LEN; k++)
+      printf("%d,%d,%.5f\r\n", k, (k - M4C_PRE) * 50, (double)(g_step_sum[k] / (float)M4C_REPEAT));
+    printf("---- END ----\r\n");
   }
 #endif
   /* USER CODE END 2 */

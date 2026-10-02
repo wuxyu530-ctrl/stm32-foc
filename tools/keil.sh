@@ -3,7 +3,7 @@
 #
 # 用法：tools/keil.sh build     增量编译（= Keil 里的 F7）
 #       tools/keil.sh rebuild   全部重编（= Rebuild all）
-#       tools/keil.sh flash     编译并下载到板子（= Load）
+#       tools/keil.sh flash     先增量编译，再下载到板子（= F7 + Load）
 #
 # 注意：Keil GUI 里如果同时开着这个工程，命令行编译会和它抢文件锁。
 #       用本脚本时把 Keil GUI 关掉，或者只在 GUI 里调试、不在 GUI 里编译。
@@ -27,8 +27,21 @@ esac
 [ -x "$UV4" ] || { echo "找不到 UV4.exe: $UV4" >&2; exit 2; }
 
 cd "$PROJ_DIR"
+WINPROJ="$(wslpath -w "$PROJ_DIR/$PROJ")"
+
+# UV4 -f 只下载现有的 axf，不会编译。flash 前先增量编译，避免烧进旧程序。
+if [ "$MODE" = flash ]; then
+    rm -f uv4_build.log
+    "$UV4" -b "$WINPROJ" -j0 -o uv4_build.log
+    BRC=$?
+    if [ $BRC -ge 2 ]; then
+        [ -f uv4_build.log ] && tr -d '\r' < uv4_build.log
+        echo "== 编译失败，未烧录 =="; exit 1
+    fi
+fi
+
 rm -f "$LOG"
-"$UV4" $FLAG "$(wslpath -w "$PROJ_DIR/$PROJ")" -j0 -o "$LOG"
+"$UV4" $FLAG "$WINPROJ" -j0 -o "$LOG"
 RC=$?
 
 # Keil 的日志是 CRLF，去掉 \r 再打印，VS Code 的 problemMatcher 才能匹配
