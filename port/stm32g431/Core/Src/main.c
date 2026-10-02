@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include "svpwm.h"
 #include "transform.h"
+#include "current_sense.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,7 +44,15 @@
 #define APP_M2_OPENLOOP    1   /* 开环 SVPWM 拖电机转 */
 #define APP_M4A_ENCODER    2   /* 不开 PWM，手转电机，串口看编码器读数 */
 #define APP_M4A2_CALIB     3   /* d 轴对齐 + 慢速拖转，测极对数、电角度零点、方向 */
-#define APP_MODE           APP_M4A2_CALIB
+#define APP_M3_CURRENT     4   /* 电流采样：零点标定 → 直流矢量验符号 → 开环转动看三相波形 */
+#define APP_MODE           APP_M3_CURRENT
+
+/* M3 电流采样参数 */
+#define M3_U_DC            1.5f   /* 直流矢量测试电压 [V] */
+#define M3_U_ROT           2.0f   /* 开环转动电压 [V] */
+#define M3_F_ROT           5.0f   /* 开环转动电频率 [Hz] */
+#define M3_I_TRIP          2.0f   /* 软件过流保护阈值 [A]：任一相超过即关 PWM */
+#define PWM_HZ             20000.0f
 
 /* M4a-2 标定参数 */
 #define CAL_U_ALIGN        1.0f   /* d 轴电压 [V]。GM2804 相电阻几欧，1 V 约零点几安 */
@@ -78,6 +87,21 @@
 static volatile uint32_t g_enc_z_count  = 0;   /* Z 脉冲累计次数（每转一圈 +1） */
 static volatile uint32_t g_enc_cnt_at_z = 0;   /* 最近一次 Z 脉冲到来时 TIM4 的计数值 */
 static int32_t           g_enc_pos      = 0;   /* 上电以来的累计位置 [count]，处理了回绕，可正可负 */
+
+/* ---- 20 kHz 控制中断（cs_on_sample）与主循环共享的状态 ---- */
+typedef enum { CTL_IDLE = 0, CTL_HOLD, CTL_ROTATE } ctl_mode_t;
+static volatile ctl_mode_t g_ctl_mode  = CTL_IDLE;  /* IDLE：中断里不写 CCR */
+static volatile float      g_ctl_ud    = 0.0f;
+static volatile float      g_ctl_uq    = 0.0f;
+static volatile float      g_ctl_theta = 0.0f;      /* HOLD：固定角度；ROTATE：每周期递增 */
+static volatile float      g_ctl_f     = 0.0f;      /* ROTATE 的电频率 [Hz] */
+static volatile foc_abc_t  g_i_abc;                 /* 最近一次三相电流 [A] */
+static volatile int        g_fault     = 0;         /* 过流跳闸后置 1 */
+
+/* 求平均：主循环设 g_avg_left = n，中断每周期累加一次并减一，减到 0 表示完成 */
+static volatile uint32_t   g_avg_left  = 0;
+static volatile float      g_avg_sum[3];
+static volatile float      g_avg_min, g_avg_max;    /* a 相的最小/最大值，看噪声 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -154,6 +178,67 @@ static void pwm_start_zero(void)
     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
     HAL_TIM_PWM_Start  (&htim1, TIM_CHANNEL_3);
     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+}
+
+/* ---- 20 kHz 控制中断：每个 PWM 周期 ADC 采完三相后由 current_sense.c 调用 ---- */
+void cs_on_sample(const foc_abc_t *i)
+{
+  DBG_PIN_GPIO_Port->BSRR = DBG_PIN_Pin;           /* PC11 拉高：示波器看中断时刻和耗时 */
+
+  g_i_abc.a = i->a; g_i_abc.b = i->b; g_i_abc.c = i->c;
+
+  /* 软件过流保护：任一相超阈值，立即关掉 TIM1 主输出（六管全关），不等主循环 */
+  if (fabsf(i->a) > M3_I_TRIP || fabsf(i->b) > M3_I_TRIP || fabsf(i->c) > M3_I_TRIP) {
+    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);
+    g_ctl_mode = CTL_IDLE;
+    g_fault = 1;
+  }
+
+  if (g_avg_left) {
+    g_avg_sum[0] += i->a; g_avg_sum[1] += i->b; g_avg_sum[2] += i->c;
+    if (i->a < g_avg_min) g_avg_min = i->a;
+    if (i->a > g_avg_max) g_avg_max = i->a;
+    g_avg_left--;
+  }
+
+  switch (g_ctl_mode) {
+    case CTL_HOLD:
+      apply_udq(g_ctl_ud, g_ctl_uq, g_ctl_theta);
+      break;
+    case CTL_ROTATE: {
+      float th = g_ctl_theta + FOC_2PI * g_ctl_f / PWM_HZ;   /* 每周期前进 2π·f/20000 */
+      if (th >= FOC_2PI) th -= FOC_2PI;
+      g_ctl_theta = th;
+      apply_udq(g_ctl_ud, g_ctl_uq, th);
+      break;
+    }
+    default:
+      break;
+  }
+
+  DBG_PIN_GPIO_Port->BRR = DBG_PIN_Pin;
+}
+
+/* 阻塞求 n 个周期的三相电流平均值，同时给出 a 相的峰峰值 */
+static void avg_currents(uint32_t n, float out[3], float *pp_a)
+{
+  g_avg_sum[0] = g_avg_sum[1] = g_avg_sum[2] = 0.0f;
+  g_avg_min = 1e9f; g_avg_max = -1e9f;
+  g_avg_left = n;
+  while (g_avg_left) { }
+  out[0] = g_avg_sum[0] / (float)n;
+  out[1] = g_avg_sum[1] / (float)n;
+  out[2] = g_avg_sum[2] / (float)n;
+  if (pp_a) *pp_a = g_avg_max - g_avg_min;
+}
+
+static void print_avg(const char *tag, uint32_t n)
+{
+  float a[3], pp;
+  avg_currents(n, a, &pp);
+  printf("%-14s ia=%+7.1f  ib=%+7.1f  ic=%+7.1f  sum=%+6.1f mA   (ia p-p %.1f mA)\r\n",
+         tag, (double)(a[0]*1000.0f), (double)(a[1]*1000.0f), (double)(a[2]*1000.0f),
+         (double)((a[0]+a[1]+a[2])*1000.0f), (double)(pp*1000.0f));
 }
 /* USER CODE END 0 */
 
@@ -245,6 +330,58 @@ int main(void)
     uint32_t cnt0 = __HAL_TIM_GET_COUNTER(&htim4);
     printf("ALIGN theta_e=0  ->  enc cnt=%lu  pos=%ld\r\n",
            (unsigned long)cnt0, (long)g_enc_pos);
+  }
+
+#elif APP_MODE == APP_M3_CURRENT
+  printf("M3: current sensing. U_dc=%.1f V, rotate %.1f V @ %.1f Hz, trip %.1f A\r\n",
+         (double)M3_U_DC, (double)M3_U_ROT, (double)M3_F_ROT, (double)M3_I_TRIP);
+
+  /* ① 运放、ADC 准备好；只启动 TIM1 计数器（不开输出），让 TRGO2 开始每周期触发 ADC */
+  cs_init();
+  __HAL_TIM_ENABLE(&htim1);
+  HAL_Delay(100);
+
+  /* ② 零点标定：MOS 全关，没有电流，此时的码值就是零点 */
+  {
+    bool ok = cs_calibrate_offset(4000);
+    float c0[3]; cs_get_offset(c0);
+    printf("[1] offset  code0 = %.1f / %.1f / %.1f   (nominal %u)  %s\r\n",
+           (double)c0[0], (double)c0[1], (double)c0[2], CS_CODE0_NOMINAL, ok ? "OK" : "!! CHECK");
+  }
+
+  /* ③ 零点标定之后、仍然 MOS 全关：电流应该 ≈ 0，峰峰值就是采样噪声 */
+  print_avg("[2] MOS off", 4000);
+
+  /* ④ 开 PWM，零矢量：六管开关，但相间电压为零，电流仍应 ≈ 0 */
+  pwm_start_zero();
+  HAL_Delay(500);
+  print_avg("[3] zero vec", 4000);
+
+  /* ⑤ 直流矢量验符号：电压矢量依次指向 A、B、C 相轴（0°、120°、240°）。
+   *    指向哪一相，电流就从那一相流进电机、从另外两相流出：
+   *    该相电流应为正，另外两相各约为它的 -1/2，三相之和 ≈ 0 */
+  {
+    const float   th[3]  = { 0.0f, FOC_2PI / 3.0f, 2.0f * FOC_2PI / 3.0f };
+    const char   *tag[3] = { "[4] DC -> A", "[5] DC -> B", "[6] DC -> C" };
+    for (int k = 0; k < 3 && !g_fault; k++) {
+      g_ctl_ud = M3_U_DC; g_ctl_uq = 0.0f; g_ctl_theta = th[k];
+      g_ctl_mode = CTL_HOLD;
+      HAL_Delay(400);                               /* 等转子转过去对齐、电流稳定 */
+      print_avg(tag[k], 4000);
+    }
+    g_ctl_mode = CTL_IDLE;
+    const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+    pwm_set_duty(&zero);
+  }
+
+  if (g_fault) {
+    printf("!! OVERCURRENT TRIP, PWM off\r\n");
+  } else {
+    /* ⑥ 开环转动，主循环以 1 kHz 把三相电流按 VOFA+ FireWater 格式输出 */
+    printf("[7] rotating. Switch VOFA+ engine to FireWater in 5 s ...\r\n");
+    HAL_Delay(5000);
+    g_ctl_ud = 0.0f; g_ctl_uq = M3_U_ROT; g_ctl_f = M3_F_ROT; g_ctl_theta = 0.0f;
+    g_ctl_mode = CTL_ROTATE;
   }
 #endif
   /* USER CODE END 2 */
@@ -346,6 +483,18 @@ int main(void)
           printf("direction           = %s\r\n",
                  per_rev > 0 ? "+1 (theta_e up -> count up)" : "-1 (theta_e up -> count DOWN)");
         }
+      }
+    }
+#elif APP_MODE == APP_M3_CURRENT
+    {
+      static uint32_t last_ms = 0;
+      static int      tripped_reported = 0;
+      uint32_t now = HAL_GetTick();
+      if (g_fault && !tripped_reported) { printf("!! OVERCURRENT TRIP, PWM off\r\n"); tripped_reported = 1; }
+      if (g_ctl_mode == CTL_ROTATE && now != last_ms) {   /* 1 kHz 抽样输出，VOFA+ FireWater: "名字:v1,v2,...\n" */
+        last_ms = now;
+        float a = g_i_abc.a, b = g_i_abc.b, c = g_i_abc.c;
+        printf("i:%.3f,%.3f,%.3f,%.3f\n", (double)a, (double)b, (double)c, (double)(a + b + c));
       }
     }
 #endif
