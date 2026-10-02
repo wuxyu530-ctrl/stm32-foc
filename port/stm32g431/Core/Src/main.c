@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <math.h>
+#include <stdio.h>
 #include "svpwm.h"
 #include "transform.h"
 /* USER CODE END Includes */
@@ -38,6 +39,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* 当前跑哪个实验。改这一行再编译烧录即可切换。 */
+#define APP_M2_OPENLOOP    1   /* 开环 SVPWM 拖电机转 */
+#define APP_M4A_ENCODER    2   /* 不开 PWM，手转电机，串口看编码器读数 */
+#define APP_MODE           APP_M4A_ENCODER
+
 #define TIM1_ARR   4250u
 
 /* M2：开环 SVPWM。每 1 ms 电角度前进一步，U_dq = (0, U_AMP) 经逆 Park → SVPWM → CCR。
@@ -59,7 +65,11 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+/* M4a：Z 相中断和主循环共享的变量。
+ * 中断里写、主循环里读，必须加 volatile：告诉编译器"这个变量随时可能被别处改掉"，
+ * 每次都老老实实去内存里读，不许把它缓存在寄存器里或者优化掉。 */
+static volatile uint32_t g_enc_z_count  = 0;   /* Z 脉冲累计次数（每转一圈 +1） */
+static volatile uint32_t g_enc_cnt_at_z = 0;   /* 最近一次 Z 脉冲到来时 TIM4 的计数值 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,6 +80,24 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ---- printf 重定向到 USART2（经板载 ST-LINK 虚拟串口到电脑） ----
+ * AC6 标准库默认用"半主机"（借调试器输出）实现 printf，脱离调试器运行会卡死。
+ * 下面声明不用半主机，补上库需要的几个底层函数，并让 fputc 走 USART2。 */
+__asm(".global __use_no_semihosting");
+void  _sys_exit(int ret)                       { (void)ret; while (1) {} }
+void  _ttywrch(int ch)                         { (void)ch; }
+char *_sys_command_string(char *cmd, int len)  { (void)cmd; (void)len; return NULL; }
+FILE  __stdout;                                /* 自己提供 stdout，库就不用半主机去打开它 */
+FILE  __stdin;
+
+int fputc(int ch, FILE *f)
+{
+    (void)f;
+    uint8_t c = (uint8_t)ch;
+    HAL_UART_Transmit(&huart2, &c, 1, HAL_MAX_DELAY);
+    return ch;
+}
+
 /* 把三相占空比写进 TIM1 CCR1~3（预装载使能，实际在下一个更新事件生效） */
 static void pwm_set_duty(const foc_abc_t *d)
 {
@@ -117,6 +145,10 @@ int main(void)
   MX_TIM4_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  printf("\r\n==== 3-phase-foc, APP_MODE=%d, SYSCLK=%lu Hz ====\r\n",
+         APP_MODE, (unsigned long)SystemCoreClock);
+
+#if APP_MODE == APP_M2_OPENLOOP
   {
     /* 先输出零矢量（三相 0.5），再开 PWM；此时相间电压为零，电机不动 */
     const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
@@ -132,6 +164,17 @@ int main(void)
     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
     /* TIM1 是高级定时器，HAL_TIM_PWM_Start 内部会置 MOE，不必手动开 */
   }
+#elif APP_MODE == APP_M4A_ENCODER
+  /* PWM 不启动，六个管子全关，电机可以用手自由转动。 */
+
+  /* 启动 TIM4 编码器接口。CubeMX 已配成 TI1+TI2 四倍频、ARR = 4095（1024 线 × 4 = 4096 计数/圈）。
+   * 必须用 TIM_CHANNEL_ALL：A 相进 CH1、B 相进 CH2，两路都要开才能判方向、四倍频计数。 */
+  if (HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL) != HAL_OK) {
+    printf("TIM4 encoder start FAILED\r\n");
+  }
+  printf("M4a: turn the motor by hand. 1 rev should be 4096 counts and 1 Z pulse.\r\n");
+
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -141,6 +184,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+#if APP_MODE == APP_M2_OPENLOOP
     {
       static uint32_t last_ms = 0;
       static float    theta   = 0.0f;              /* 电角度 [rad] */
@@ -162,6 +206,35 @@ int main(void)
         pwm_set_duty(&duty);
       }
     }
+#elif APP_MODE == APP_M4A_ENCODER
+    {
+      static uint32_t last_print = 0;
+
+      if (HAL_GetTick() - last_print >= 100) {     /* 每 100 ms 打印一行 */
+        last_print += 100;
+
+        static uint32_t last_cnt = 0;
+        static int32_t  pos      = 0;              /* 上电以来的累计位置 [count]，可正可负 */
+
+        uint32_t cnt = __HAL_TIM_GET_COUNTER(&htim4);   /* 0 ~ 4095 */
+
+        /* 计数器到 4095 会回到 0（或反过来），直接相减会差一整圈。
+         * 100 ms 内手转不可能超过半圈，所以差值超过 ±2048 就说明跨过了回绕点，补回一圈。 */
+        int32_t d = (int32_t)cnt - (int32_t)last_cnt;
+        if (d >  2048) d -= 4096;
+        if (d < -2048) d += 4096;
+        pos     += d;
+        last_cnt = cnt;
+
+        printf("cnt=%4lu  pos=%+7ld  rev=%+.3f  z=%lu  cnt@z=%4lu\r\n",
+               (unsigned long)cnt,
+               (long)pos,
+               (double)pos / 4096.0,
+               (unsigned long)g_enc_z_count,
+               (unsigned long)g_enc_cnt_at_z);
+      }
+    }
+#endif
   }
   /* USER CODE END 3 */
 }
@@ -216,6 +289,15 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* PB8 (ENC_Z) 上升沿中断回调。编码器每转一圈，Z 相输出一个脉冲。
+ * HAL 的 EXTI9_5_IRQHandler → HAL_GPIO_EXTI_IRQHandler → 这里。 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == ENC_Z_Pin) {
+    g_enc_z_count++;
+    g_enc_cnt_at_z = __HAL_TIM_GET_COUNTER(&htim4);   /* 记下 Z 到来时的位置：每圈应该几乎一样 */
+  }
+}
 
 /* USER CODE END 4 */
 
