@@ -37,6 +37,9 @@ bool cs_calibrate_offset(uint32_t n);
 /* 读标定得到的零点 */
 void cs_get_offset(float code0[3]);
 
+/* 采样回调累计次数（调试用：每秒应增加 20000） */
+uint32_t cs_isr_count(void);
+
 /* 最近一次采样的原始码值（调试用） */
 void cs_get_raw(uint16_t code[3]);
 

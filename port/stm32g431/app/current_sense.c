@@ -11,6 +11,7 @@ static volatile uint16_t s_code[3];             /* 最近一次原始码值 */
 static float             s_code0[3] = { CS_CODE0_NOMINAL, CS_CODE0_NOMINAL, CS_CODE0_NOMINAL };
 
 /* 零点标定期间：ISR 只累加，不回调应用层 */
+static volatile uint32_t s_isr_count   = 0;     /* 回调次数，用来核对是否正好 20 kHz */
 static volatile bool     s_calibrating = false;
 static volatile uint32_t s_cal_count   = 0;
 static volatile uint32_t s_cal_sum[3];
@@ -29,9 +30,16 @@ void cs_init(void)
     /* 开启注入组，等待 TIM1_TRGO2 硬件触发。
      * ADC1 只转 1 个通道（相 1），ADC2 顺序转 2 个通道（相 2、相 3），ADC2 最后完成，
      * 所以只开 ADC2 的注入序列完成中断（JEOS），在那里一次读全三相。 */
+    /* HAL 按 Init.EOCSelection 决定开哪个注入中断：SINGLE_CONV → JEOC（每个通道转完都进一次），
+     * SEQ_CONV → JEOS（整个序列转完才进一次）。CubeMX 生成的是 SINGLE_CONV，ADC2 要转两个通道，
+     * 会出现一个 PWM 周期进两次中断、第一次读到相 3 旧值的情况。这里改成 JEOS。 */
+    hadc2.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+
     HAL_ADCEx_InjectedStart(&hadc1);
     HAL_ADCEx_InjectedStart_IT(&hadc2);
 }
+
+uint32_t cs_isr_count(void) { return s_isr_count; }
 
 bool cs_calibrate_offset(uint32_t n)
 {
@@ -72,6 +80,9 @@ void cs_get_raw(uint16_t code[3])
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance != ADC2) return;
+    /* 双保险：只在 ADC2 整个注入序列（相 2、相 3）都转完时处理 */
+    if (!__HAL_ADC_GET_FLAG(hadc, ADC_FLAG_JEOS)) return;
+    s_isr_count++;
 
     uint16_t c0 = (uint16_t)HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);  /* 相 1：OPAMP1 */
     uint16_t c1 = (uint16_t)HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);  /* 相 2：OPAMP2 */

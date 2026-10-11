@@ -487,6 +487,11 @@ int main(void)
   cs_init();
   __HAL_TIM_ENABLE(&htim1);
   HAL_Delay(100);
+  {
+    uint32_t c0 = cs_isr_count();                  /* 自检：采样回调应正好每秒 20000 次 */
+    HAL_Delay(1000);
+    printf("current-sense ISR rate = %lu /s (expect 20000)\r\n", (unsigned long)(cs_isr_count() - c0));
+  }
   if (!cs_calibrate_offset(4000)) printf("!! offset calibration suspicious\r\n");
   pwm_start_zero();
   HAL_Delay(300);
