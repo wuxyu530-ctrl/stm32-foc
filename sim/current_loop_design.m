@@ -8,6 +8,7 @@ clear; close all;
 R  = 3.21;        % 相电阻 [Ω]
 L  = 0.88e-3;     % 相电感 [H]
 Td = 75e-6;       % 延迟 [s]，通用 1.5*Ts（保守）
+Ts = 50e-6;       % PWM / 控制周期 [s]（20 kHz），离散模型用
 Vbus = 12;        % 母线电压 [V]
 Vmax = Vbus/sqrt(3);   % SVPWM 线性区最大相电压幅值 ≈ 6.93 V，PI 输出限幅用
 
