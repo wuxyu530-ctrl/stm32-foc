@@ -459,6 +459,16 @@
               <FileType>1</FileType>
               <FilePath>..\..\..\core\transform.c</FilePath>
             </File>
+            <File>
+              <FileName>pi.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\core\pi.c</FilePath>
+            </File>
+            <File>
+              <FileName>foc_current.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\core\foc_current.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

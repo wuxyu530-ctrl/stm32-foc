@@ -31,6 +31,7 @@
 #include "svpwm.h"
 #include "transform.h"
 #include "current_sense.h"
+#include "foc_current.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,7 +48,23 @@
 #define APP_M3_CURRENT     4   /* 电流采样：零点标定 → 直流矢量验符号 → 开环转动看三相波形 */
 #define APP_M4B_RES        5   /* 测相电阻：锁转子，多个直流电压点线性拟合 U = R·I + U0 */
 #define APP_M4C_IND        6   /* 测电感：d 轴电压阶跃，重复叠加平均，输出电流波形供拟合 τ = L/R */
-#define APP_MODE           APP_M4C_IND
+#define APP_M7_CURRENT     7   /* 电流闭环：对齐 → 角度自检 → d 轴电流阶跃叠加平均，和 Simulink 对比 */
+#define APP_MODE           APP_M7_CURRENT
+
+/* ---- M7 电流闭环参数【Claude 代写，待复核】见 docs/M7_电流闭环.md ---- */
+#define MOTOR_R            3.21f      /* 相电阻 [Ω]，M4b */
+#define MOTOR_L            0.88e-3f   /* 相电感 [H]，M4c */
+#define MOTOR_POLE_PAIRS   7          /* 极对数，M4a-2 实测 7.004 */
+#define ENC_DIR            (-1)       /* M4a-2：θe 增大时编码器计数减小 */
+#define M7_FBW             1000.0f    /* 电流环带宽 [Hz]：Kp = L·2π·FBW，Ki = R·2π·FBW */
+#define M7_U_ALIGN         0.8f       /* 对齐与角度自检用的 d 轴电压 [V]（开环） */
+#define M7_ID_LO           0.2f       /* 阶跃前 d 轴电流目标 [A]：保持转子对齐 */
+#define M7_ID_HI           1.0f       /* 阶跃后 [A]。需要电压 R·1 A ≈ 3.2 V，远低于 v_max ≈ 6.3 V */
+#define M7_PERIOD          200        /* 一个高低周期的 PWM 周期数：200 × 50 µs = 10 ms */
+#define M7_STEP_AT         100        /* 第 100 个周期目标从 LO 跳到 HI */
+#define M7_PRE             10         /* 记录阶跃前 10 个点作基线 */
+#define M7_LEN             60         /* 共记录 60 个点（3 ms） */
+#define M7_REPEAT          64         /* 叠加次数：噪声降为 1/8 */
 
 /* M3 电流采样参数 */
 #define M3_U_DC            1.5f   /* 直流矢量测试电压 [V] */
@@ -104,7 +121,7 @@ static volatile uint32_t g_enc_cnt_at_z = 0;   /* 最近一次 Z 脉冲到来时
 static int32_t           g_enc_pos      = 0;   /* 上电以来的累计位置 [count]，处理了回绕，可正可负 */
 
 /* ---- 20 kHz 控制中断（cs_on_sample）与主循环共享的状态 ---- */
-typedef enum { CTL_IDLE = 0, CTL_HOLD, CTL_ROTATE } ctl_mode_t;
+typedef enum { CTL_IDLE = 0, CTL_HOLD, CTL_ROTATE, CTL_CURRENT } ctl_mode_t;
 static volatile ctl_mode_t g_ctl_mode  = CTL_IDLE;  /* IDLE：中断里不写 CCR */
 static volatile float      g_ctl_ud    = 0.0f;
 static volatile float      g_ctl_uq    = 0.0f;
@@ -123,6 +140,20 @@ static volatile int        g_step_run  = 0;         /* 1：中断里执行阶跃
 static volatile uint32_t   g_step_n    = 0;         /* 当前在周期内的第几个 PWM 周期 */
 static volatile uint32_t   g_step_rep  = 0;         /* 已完成的重复次数 */
 static float               g_step_sum[M4C_LEN];     /* 每个采样点 id 的累加和 */
+
+/* ---- M7 电流闭环【Claude 代写，待复核】 ---- */
+static foc_cur_t           g_cur;                   /* dq 电流环（两个 PI + 限幅），只在中断里调用 step */
+static volatile uint32_t   g_enc_cnt0  = 0;         /* 对齐到 θe = 0 时的编码器计数，每次上电重新测 */
+static volatile float      g_id_ref    = 0.0f;      /* CTL_CURRENT 的 dq 电流目标 [A] */
+static volatile float      g_iq_ref    = 0.0f;
+static volatile float      g_theta_e   = 0.0f;      /* 中断里最近一次由编码器算出的电角度 [rad] */
+static volatile foc_cur_out_t g_cur_out;            /* 中断里最近一次的 id、iq、vd、vq */
+static volatile int        g_m7_run    = 0;         /* 1：中断里执行 d 轴电流阶跃并叠加记录 */
+static volatile uint32_t   g_m7_n      = 0;         /* 当前在高低周期内的第几个 PWM 周期 */
+static volatile uint32_t   g_m7_rep    = 0;         /* 已完成的重复次数 */
+static float               g_m7_id[M7_LEN];         /* 每个采样点 id 的累加和 */
+static float               g_m7_iq[M7_LEN];         /* iq 的累加和（应始终 ≈ 0） */
+static float               g_m7_vd[M7_LEN];         /* vd 指令的累加和（对照 Simulink 的电压台阶） */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -201,6 +232,17 @@ static void pwm_start_zero(void)
     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
 }
 
+/* 由编码器计数算电角度 θe ∈ [0, 2π)【Claude 代写，待复核】
+ *   θe = 2π · frac( ENC_DIR · 极对数 · (cnt − cnt0) / 4096 )
+ * cnt0 是对齐到 θe = 0 时的计数；frac() 取小数部分，把多圈电角度折回一圈。 */
+static float theta_e_from_encoder(void)
+{
+  int32_t d = (int32_t)__HAL_TIM_GET_COUNTER(&htim4) - (int32_t)g_enc_cnt0;   /* −4095 ~ +4095 */
+  float   e = (float)(ENC_DIR * MOTOR_POLE_PAIRS * d) / (float)ENC_CPR;        /* 电角度圈数，可为负 */
+  e -= floorf(e);                                                              /* 取小数部分 → [0, 1) */
+  return FOC_2PI * e;
+}
+
 /* ---- 20 kHz 控制中断：每个 PWM 周期 ADC 采完三相后由 current_sense.c 调用 ---- */
 void cs_on_sample(const foc_abc_t *i)
 {
@@ -246,6 +288,39 @@ void cs_on_sample(const foc_abc_t *i)
       if (th >= FOC_2PI) th -= FOC_2PI;
       g_ctl_theta = th;
       apply_udq(g_ctl_ud, g_ctl_uq, th);
+      break;
+    }
+    case CTL_CURRENT: {                              /* M7 电流闭环【Claude 代写，待复核】 */
+      float th = theta_e_from_encoder();
+      g_theta_e = th;
+      foc_sincos_t sc;
+      foc_sincos(th, &sc);
+
+      /* d 轴电流阶跃：目标在 LO/HI 之间切换，并按"相对阶跃时刻的位置"叠加记录 */
+      float id_ref = g_id_ref;
+      uint32_t n = g_m7_n;
+      if (g_m7_run) id_ref = (n < M7_STEP_AT) ? M7_ID_LO : M7_ID_HI;
+
+      foc_abc_t     duty;
+      foc_cur_out_t o;
+      foc_cur_step(&g_cur, i, &sc, id_ref, g_iq_ref, &duty, &o);
+      pwm_set_duty(&duty);                           /* 下一个更新事件生效（约半个周期后） */
+      g_cur_out.id = o.id; g_cur_out.iq = o.iq; g_cur_out.vd = o.vd; g_cur_out.vq = o.vq;
+
+      if (g_m7_run) {
+        /* 第 n 个样本里：o.id 是本次采到的电流，o.vd 是本次算出、下个周期才生效的电压 */
+        if (n >= M7_STEP_AT - M7_PRE && n < M7_STEP_AT - M7_PRE + M7_LEN) {
+          uint32_t k = n - (M7_STEP_AT - M7_PRE);
+          g_m7_id[k] += o.id;
+          g_m7_iq[k] += o.iq;
+          g_m7_vd[k] += o.vd;
+        }
+        if (++n >= M7_PERIOD) {
+          n = 0;
+          if (++g_m7_rep >= M7_REPEAT) g_m7_run = 0;   /* 结束后目标回到 g_id_ref */
+        }
+        g_m7_n = n;
+      }
       break;
     }
     default:
@@ -518,6 +593,96 @@ int main(void)
     for (int k = 0; k < M4C_LEN; k++)
       printf("%d,%d,%.5f\r\n", k, (k - M4C_PRE) * 50, (double)(g_step_sum[k] / (float)M4C_REPEAT));
     printf("---- END ----\r\n");
+  }
+
+#elif APP_MODE == APP_M7_CURRENT
+  /* 【Claude 代写，待复核】流程与预期结果见 docs/M7_电流闭环.md */
+  {
+    const float wbw = FOC_2PI * M7_FBW;
+    const float kp  = MOTOR_L * wbw;               /* ≈ 5.53 V/A */
+    const float ki  = MOTOR_R * wbw;               /* ≈ 20169 V/(A·s) */
+    printf("M7: current loop. Kp=%.3f V/A Ki=%.0f V/(A*s), id step %.2f -> %.2f A, %d repeats\r\n",
+           (double)kp, (double)ki, (double)M7_ID_LO, (double)M7_ID_HI, M7_REPEAT);
+
+    /* ① 电流采样准备：与 M3/M4 相同 */
+    cs_init();
+    __HAL_TIM_ENABLE(&htim1);
+    HAL_Delay(100);
+    {
+      uint32_t c0 = cs_isr_count();
+      HAL_Delay(1000);
+      printf("[1] ISR rate = %lu /s (expect 20000)\r\n", (unsigned long)(cs_isr_count() - c0));
+    }
+    if (!cs_calibrate_offset(4000)) printf("!! offset calibration suspicious\r\n");
+    HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+    pwm_start_zero();
+    HAL_Delay(300);
+
+    /* ② 开环对齐到 θe = 0（先 90° 再 0°，避开 180° 不稳定点），记下此刻的编码器计数 */
+    g_ctl_ud = M7_U_ALIGN; g_ctl_uq = 0.0f; g_ctl_theta = FOC_PI / 2.0f; g_ctl_mode = CTL_HOLD;
+    HAL_Delay(400);
+    g_ctl_theta = 0.0f;
+    HAL_Delay(800);
+    g_enc_cnt0 = __HAL_TIM_GET_COUNTER(&htim4);
+    printf("[2] aligned: enc cnt0 = %lu\r\n", (unsigned long)g_enc_cnt0);
+
+    /* ③ 角度自检：开环把转子依次拉到 90°、180°、270°、0°，比较"指令角"和"编码器算出的角"。
+     *    两者应相差几度以内。若差很多或方向相反，说明极对数 / ENC_DIR / cnt0 有问题，不要进入闭环。 */
+    {
+      const float deg[4] = { 90.0f, 180.0f, 270.0f, 0.0f };
+      int ok = 1;
+      for (int k = 0; k < 4 && !g_fault; k++) {
+        g_ctl_theta = deg[k] * FOC_PI / 180.0f;
+        HAL_Delay(500);
+        float th  = theta_e_from_encoder() * 180.0f / FOC_PI;
+        float err = th - deg[k];
+        while (err >  180.0f) err -= 360.0f;
+        while (err < -180.0f) err += 360.0f;
+        if (fabsf(err) > 20.0f) ok = 0;
+        printf("[3] cmd %5.1f deg  enc %5.1f deg  err %+5.1f deg\r\n", (double)deg[k], (double)th, (double)err);
+      }
+      if (!ok) {
+        g_ctl_mode = CTL_IDLE;
+        const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+        pwm_set_duty(&zero);
+        printf("!! angle check FAILED: check MOTOR_POLE_PAIRS / ENC_DIR. Closed loop NOT started.\r\n");
+        while (1) { }
+      }
+    }
+
+    /* ④ 切到电流闭环：先清积分，再一次性切换模式。保持 id = ID_LO、iq = 0 半秒，打印稳态 */
+    foc_cur_init(&g_cur, kp, ki, 1.0f / PWM_HZ, M2_VDC, M2_DMAX);
+    foc_cur_reset(&g_cur);
+    g_id_ref = M7_ID_LO; g_iq_ref = 0.0f;
+    g_ctl_mode = CTL_CURRENT;                       /* 中断下一次就按电流闭环运行 */
+    HAL_Delay(500);
+    printf("[4] closed loop hold: theta_e=%.1f deg  id=%.3f A  iq=%.3f A  vd=%.3f V  vq=%.3f V  (v_max %.2f V)\r\n",
+           (double)(g_theta_e * 180.0f / FOC_PI), (double)g_cur_out.id, (double)g_cur_out.iq,
+           (double)g_cur_out.vd, (double)g_cur_out.vq, (double)g_cur.v_max);
+
+    /* ⑤ d 轴电流阶跃 LO → HI，重复叠加 */
+    for (int k = 0; k < M7_LEN; k++) { g_m7_id[k] = 0.0f; g_m7_iq[k] = 0.0f; g_m7_vd[k] = 0.0f; }
+    g_m7_n = 0; g_m7_rep = 0; g_m7_run = 1;
+    while (g_m7_run && !g_fault) { }               /* 64 × 10 ms ≈ 0.64 s */
+
+    /* ⑥ 结束：关闭闭环，回零矢量 */
+    g_ctl_mode = CTL_IDLE;
+    {
+      const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+      pwm_set_duty(&zero);
+    }
+    if (g_fault) {
+      printf("!! OVERCURRENT TRIP\r\n");
+    } else {
+      printf("---- M7 STEP (k, t_us, id_ref, id_A, iq_A, vd_V) ; id_ref steps at k=%d ----\r\n", M7_PRE);
+      for (int k = 0; k < M7_LEN; k++) {
+        float ref = (k < M7_PRE) ? M7_ID_LO : M7_ID_HI;
+        printf("%d,%d,%.2f,%.5f,%.5f,%.4f\r\n", k, (k - M7_PRE) * 50, (double)ref,
+               (double)(g_m7_id[k] / (float)M7_REPEAT), (double)(g_m7_iq[k] / (float)M7_REPEAT),
+               (double)(g_m7_vd[k] / (float)M7_REPEAT));
+      }
+      printf("---- END ----\r\n");
+    }
   }
 #endif
   /* USER CODE END 2 */
