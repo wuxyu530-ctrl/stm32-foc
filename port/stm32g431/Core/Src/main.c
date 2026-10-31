@@ -49,7 +49,8 @@
 #define APP_M4B_RES        5   /* 测相电阻：锁转子，多个直流电压点线性拟合 U = R·I + U0 */
 #define APP_M4C_IND        6   /* 测电感：d 轴电压阶跃，重复叠加平均，输出电流波形供拟合 τ = L/R */
 #define APP_M7_CURRENT     7   /* 电流闭环：对齐 → 角度自检 → d 轴电流阶跃叠加平均，和 Simulink 对比 */
-#define APP_MODE           APP_M7_CURRENT
+#define APP_M8A_IQ_SPIN    8   /* q 轴电流测试：M7 的 ①～④ 之后给恒定 iq，电机加速再滑行，记录转速（为速度环测 ψf、J） */
+#define APP_MODE           APP_M8A_IQ_SPIN
 
 /* ---- M7 电流闭环参数【Claude 代写，待复核】见 docs/M7_电流闭环.md ---- */
 #define MOTOR_R            3.21f      /* 相电阻 [Ω]，M4b */
@@ -65,6 +66,14 @@
 #define M7_PRE             10         /* 记录阶跃前 10 个点作基线 */
 #define M7_LEN             60         /* 共记录 60 个点（3 ms） */
 #define M7_REPEAT          64         /* 叠加次数：噪声降为 1/8 */
+
+/* ---- M8a q 轴电流测试参数【Claude 代写，待复核】 ---- */
+#define M8_IQ              0.10f      /* q 轴电流目标 [A]：产生转矩，id = 0 */
+#define M8_T_RUN_MS        1500       /* 给 iq 的时间 [ms]，之后 iq = 0 惯性滑行 */
+#define M8_T_COAST_MS      2000       /* 滑行记录时间 [ms] */
+#define M8_LOG_MS          2          /* 每 2 ms 打印一行 */
+#define M8_RPM_WIN         5          /* 转速 = 最近 5 次记录（约 10 ms）的位置差 / 时间差 */
+#define M8_RPM_MAX         1500.0f    /* 超过这个转速把 iq 置 0。run1 在 2350 rpm（vq 接近 v_max）时过流跳闸，先避开高调制区 */
 
 /* M3 电流采样参数 */
 #define M3_U_DC            1.5f   /* 直流矢量测试电压 [V] */
@@ -595,14 +604,18 @@ int main(void)
     printf("---- END ----\r\n");
   }
 
-#elif APP_MODE == APP_M7_CURRENT
-  /* 【Claude 代写，待复核】流程与预期结果见 docs/M7_电流闭环.md */
+#elif APP_MODE == APP_M7_CURRENT || APP_MODE == APP_M8A_IQ_SPIN
+  /* 【Claude 代写，待复核】流程与预期结果见 docs/M7_电流闭环.md。M8a 共用 ①～④，从 ⑤ 开始不同 */
   {
     const float wbw = FOC_2PI * M7_FBW;
     const float kp  = MOTOR_L * wbw;               /* ≈ 5.53 V/A */
     const float ki  = MOTOR_R * wbw;               /* ≈ 20169 V/(A·s) */
     printf("M7: current loop. Kp=%.3f V/A Ki=%.0f V/(A*s), id step %.2f -> %.2f A, %d repeats\r\n",
            (double)kp, (double)ki, (double)M7_ID_LO, (double)M7_ID_HI, M7_REPEAT);
+#if APP_MODE == APP_M8A_IQ_SPIN
+    printf("M8a: iq spin test. iq=%.2f A for %d ms, then iq=0 coast %d ms\r\n",
+           (double)M8_IQ, M8_T_RUN_MS, M8_T_COAST_MS);
+#endif
 
     /* ① 电流采样准备：与 M3/M4 相同 */
     cs_init();
@@ -660,6 +673,54 @@ int main(void)
            (double)(g_theta_e * 180.0f / FOC_PI), (double)g_cur_out.id, (double)g_cur_out.iq,
            (double)g_cur_out.vd, (double)g_cur_out.vq, (double)g_cur.v_max);
 
+#if APP_MODE == APP_M8A_IQ_SPIN
+    /* ⑤ q 轴电流测试【Claude 代写，待复核】
+     *    id = 0、iq = M8_IQ：电流矢量始终超前转子 90°，电机加速；M8_T_RUN_MS 后 iq = 0，
+     *    电流环仍在运行（id = iq = 0，不产生转矩也不刹车），电机靠惯性滑行、被摩擦减速。
+     *    转速：主循环每 1 ms 读一次编码器展开成累计位置 g_enc_pos，取约 10 ms 的位置差。
+     *    正转速 = θe 增大的方向（编码器计数减小，所以乘 ENC_DIR）。 */
+    {
+      int32_t  ring_pos[M8_RPM_WIN];
+      uint32_t ring_t[M8_RPM_WIN];
+      int      ri = 0;
+      enc_update(); enc_update();                   /* 第一次调用只记起点 */
+      uint32_t t0 = HAL_GetTick(), last_tick = t0, last_log = t0;
+      for (int k = 0; k < M8_RPM_WIN; k++) { ring_pos[k] = g_enc_pos; ring_t[k] = t0; }
+
+      printf("---- M8A IQ SPIN (t_ms, pos_cnt, rpm, id_A, iq_A, vd_V, vq_V) ----\r\n");
+      g_id_ref = 0.0f; g_iq_ref = M8_IQ;            /* 两个目标同时改：中断里先读哪个都无所谓 */
+      while (!g_fault) {
+        uint32_t now = HAL_GetTick();
+        if (now == last_tick) continue;
+        last_tick = now;
+        enc_update();
+        uint32_t t = now - t0;
+        if (t >= M8_T_RUN_MS) g_iq_ref = 0.0f;
+        if (now - last_log >= M8_LOG_MS) {
+          last_log = now;
+          int      old = ri;                          /* 环形缓冲里最老的一条 */
+          float    dt  = (float)(now - ring_t[old]) * 1e-3f;
+          float    rpm = (dt > 0.0f)
+                       ? (float)(ENC_DIR * (g_enc_pos - ring_pos[old])) / (float)ENC_CPR / dt * 60.0f
+                       : 0.0f;
+          ring_pos[ri] = g_enc_pos; ring_t[ri] = now; ri = (ri + 1) % M8_RPM_WIN;
+          if (fabsf(rpm) > M8_RPM_MAX) g_iq_ref = 0.0f;
+          printf("%lu,%ld,%.1f,%.3f,%.3f,%.3f,%.3f\r\n", (unsigned long)t, (long)g_enc_pos, (double)rpm,
+                 (double)g_cur_out.id, (double)g_cur_out.iq, (double)g_cur_out.vd, (double)g_cur_out.vq);
+        }
+        if (t >= M8_T_RUN_MS + M8_T_COAST_MS) break;
+      }
+    }
+
+    /* ⑥ 结束：此时电机应已基本停下，再回零矢量（零矢量会把三相短接，转得快时会刹车） */
+    g_ctl_mode = CTL_IDLE;
+    {
+      const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+      pwm_set_duty(&zero);
+    }
+    if (g_fault) printf("!! OVERCURRENT TRIP\r\n");
+    else         printf("---- END ----\r\n");
+#else
     /* ⑤ d 轴电流阶跃 LO → HI，重复叠加 */
     for (int k = 0; k < M7_LEN; k++) { g_m7_id[k] = 0.0f; g_m7_iq[k] = 0.0f; g_m7_vd[k] = 0.0f; }
     g_m7_n = 0; g_m7_rep = 0; g_m7_run = 1;
@@ -683,6 +744,7 @@ int main(void)
       }
       printf("---- END ----\r\n");
     }
+#endif  /* APP_M8A_IQ_SPIN / APP_M7_CURRENT */
   }
 #endif
   /* USER CODE END 2 */
