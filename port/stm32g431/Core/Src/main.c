@@ -52,7 +52,7 @@
 #define APP_M7_CURRENT     7   /* 电流闭环：对齐 → 角度自检 → d 轴电流阶跃叠加平均，和 Simulink 对比 */
 #define APP_M8A_IQ_SPIN    8   /* q 轴电流测试：M7 的 ①～④ 之后给恒定 iq，电机加速再滑行，记录转速（为速度环测 ψf、J） */
 #define APP_M8B_SPEED      9   /* 速度环：M7 的 ①～④ 之后启动到 600 rpm，600 ↔ 700 rpm 阶跃叠加平均，和仿真对比 */
-#define APP_MODE           APP_M8B_SPEED
+#define APP_MODE           APP_M8A_IQ_SPIN
 
 /* ---- M7 电流闭环参数【Claude 代写，待复核】见 docs/M7_电流闭环.md ---- */
 #define MOTOR_R            3.21f      /* 相电阻 [Ω]，M4b */
@@ -70,12 +70,12 @@
 #define M7_REPEAT          64         /* 叠加次数：噪声降为 1/8 */
 
 /* ---- M8a q 轴电流测试参数【Claude 代写，待复核】 ---- */
-#define M8_IQ              0.10f      /* q 轴电流目标 [A]：产生转矩，id = 0 */
-#define M8_T_RUN_MS        1500       /* 给 iq 的时间 [ms]，之后 iq = 0 惯性滑行 */
-#define M8_T_COAST_MS      2000       /* 滑行记录时间 [ms] */
-#define M8_LOG_MS          2          /* 每 2 ms 打印一行 */
-#define M8_RPM_WIN         5          /* 转速 = 最近 5 次记录（约 10 ms）的位置差 / 时间差 */
-#define M8_RPM_MAX         1500.0f    /* 超过这个转速把 iq 置 0。run1 在 2350 rpm（vq 接近 v_max）时过流跳闸，先避开高调制区 */
+#define M8_IQ_LIST         { 0.10f, 0.20f, 0.30f }   /* 依次测的 q 轴电流 [A]，id = 0 */
+#define M8_T_RUN_MS        800        /* 每次给 iq 的最长时间 [ms]（一般先碰到转速上限），之后 iq = 0 惯性滑行 */
+#define M8_T_COAST_MS      1000       /* 滑行记录时间 [ms] */
+#define M8_LOG_MS          1          /* 每 1 ms 打印一行（0.3 A 时几十 ms 就加速完，要密一点） */
+#define M8_RPM_WIN         10         /* 转速 = 最近 10 次记录（约 10 ms）的位置差 / 时间差 */
+#define M8_RPM_MAX         1400.0f    /* 超过这个转速把 iq 置 0。run1 在 2350 rpm（vq 接近 v_max）时过流跳闸，先避开高调制区 */
 
 /* ---- M8b 速度环参数【Claude 代写，待复核】见 docs/M8b_速度环.md ---- */
 #define RPM_TO_RADS        (FOC_2PI / 60.0f)
@@ -664,8 +664,8 @@ int main(void)
     printf("M7: current loop. Kp=%.3f V/A Ki=%.0f V/(A*s), id step %.2f -> %.2f A, %d repeats\r\n",
            (double)kp, (double)ki, (double)M7_ID_LO, (double)M7_ID_HI, M7_REPEAT);
 #if APP_MODE == APP_M8A_IQ_SPIN
-    printf("M8a: iq spin test. iq=%.2f A for %d ms, then iq=0 coast %d ms\r\n",
-           (double)M8_IQ, M8_T_RUN_MS, M8_T_COAST_MS);
+    printf("M8a: iq spin test. each iq up to %d ms or %.0f rpm, then iq=0 coast %d ms\r\n",
+           M8_T_RUN_MS, (double)M8_RPM_MAX, M8_T_COAST_MS);
 #endif
 #if APP_MODE == APP_M8B_SPEED
     const float wc_w = FOC_2PI * M8B_FC;
@@ -733,20 +733,25 @@ int main(void)
 
 #if APP_MODE == APP_M8A_IQ_SPIN
     /* ⑤ q 轴电流测试【Claude 代写，待复核】
-     *    id = 0、iq = M8_IQ：电流矢量始终超前转子 90°，电机加速；M8_T_RUN_MS 后 iq = 0，
+     *    id = 0、iq = 常数：电流矢量始终超前转子 90°，电机加速；M8_T_RUN_MS 后 iq = 0，
      *    电流环仍在运行（id = iq = 0，不产生转矩也不刹车），电机靠惯性滑行、被摩擦减速。
      *    转速：主循环每 1 ms 读一次编码器展开成累计位置 g_enc_pos，取约 10 ms 的位置差。
      *    正转速 = θe 增大的方向（编码器计数减小，所以乘 ENC_DIR）。 */
-    {
+    /*    依次用 M8_IQ_LIST 里的每个电流跑一次：同一转速区间里"加速度对 iq"做直线拟合，
+     *    斜率 = Kt/J，截距 = −摩擦/J，不需要事先知道摩擦（思路同 M4b 多点拟合测电阻） */
+    static const float iq_list[] = M8_IQ_LIST;
+    enc_update();                                   /* 第一次调用只记起点 */
+    for (unsigned run = 0; run < sizeof iq_list / sizeof iq_list[0] && !g_fault; run++) {
       int32_t  ring_pos[M8_RPM_WIN];
       uint32_t ring_t[M8_RPM_WIN];
       int      ri = 0;
-      enc_update(); enc_update();                   /* 第一次调用只记起点 */
+      enc_update();
       uint32_t t0 = HAL_GetTick(), last_tick = t0, last_log = t0;
       for (int k = 0; k < M8_RPM_WIN; k++) { ring_pos[k] = g_enc_pos; ring_t[k] = t0; }
 
-      printf("---- M8A IQ SPIN (t_ms, pos_cnt, rpm, id_A, iq_A, vd_V, vq_V) ----\r\n");
-      g_id_ref = 0.0f; g_iq_ref = M8_IQ;            /* 两个目标同时改：中断里先读哪个都无所谓 */
+      printf("---- M8A IQ SPIN run %u iq=%.2f A (t_ms, pos_cnt, rpm, id_A, iq_A, vd_V, vq_V) ----\r\n",
+             run, (double)iq_list[run]);
+      g_id_ref = 0.0f; g_iq_ref = iq_list[run];     /* 两个目标同时改：中断里先读哪个都无所谓 */
       while (!g_fault) {
         uint32_t now = HAL_GetTick();
         if (now == last_tick) continue;
