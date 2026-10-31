@@ -32,6 +32,7 @@
 #include "transform.h"
 #include "current_sense.h"
 #include "foc_current.h"
+#include "foc_speed.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,7 +51,8 @@
 #define APP_M4C_IND        6   /* 测电感：d 轴电压阶跃，重复叠加平均，输出电流波形供拟合 τ = L/R */
 #define APP_M7_CURRENT     7   /* 电流闭环：对齐 → 角度自检 → d 轴电流阶跃叠加平均，和 Simulink 对比 */
 #define APP_M8A_IQ_SPIN    8   /* q 轴电流测试：M7 的 ①～④ 之后给恒定 iq，电机加速再滑行，记录转速（为速度环测 ψf、J） */
-#define APP_MODE           APP_M8A_IQ_SPIN
+#define APP_M8B_SPEED      9   /* 速度环：M7 的 ①～④ 之后启动到 600 rpm，600 ↔ 700 rpm 阶跃叠加平均，和仿真对比 */
+#define APP_MODE           APP_M8B_SPEED
 
 /* ---- M7 电流闭环参数【Claude 代写，待复核】见 docs/M7_电流闭环.md ---- */
 #define MOTOR_R            3.21f      /* 相电阻 [Ω]，M4b */
@@ -74,6 +76,21 @@
 #define M8_LOG_MS          2          /* 每 2 ms 打印一行 */
 #define M8_RPM_WIN         5          /* 转速 = 最近 5 次记录（约 10 ms）的位置差 / 时间差 */
 #define M8_RPM_MAX         1500.0f    /* 超过这个转速把 iq 置 0。run1 在 2350 rpm（vq 接近 v_max）时过流跳闸，先避开高调制区 */
+
+/* ---- M8b 速度环参数【Claude 代写，待复核】见 docs/M8b_速度环.md ---- */
+#define RPM_TO_RADS        (FOC_2PI / 60.0f)
+#define M8B_KT_J           1.1e4f     /* Kt/J [rad/(s²·A)]，M8a 实测 */
+#define M8B_FC             50.0f      /* 速度环穿越频率 [Hz]：Kp = 2π·FC/(Kt/J)，Ki = Kp·2π·FC/4 */
+#define M8B_DIV            20         /* 每 20 个 PWM 周期跑一次速度环 → Ts = 1 ms */
+#define M8B_IQ_MAX         0.4f       /* iq_ref 限幅 [A] */
+#define M8B_W_LO_RPM       600.0f     /* 阶跃前目标转速 [rpm] */
+#define M8B_W_HI_RPM       700.0f     /* 阶跃后 [rpm]。Kp × 100 rpm ≈ 0.30 A < iq_max，线性区 */
+#define M8B_PERIOD         400        /* 一个高低周期的速度环周期数：400 ms */
+#define M8B_STEP_AT        200        /* 第 200 ms 目标从 LO 跳到 HI */
+#define M8B_PRE            20         /* 记录阶跃前 20 个点作基线 */
+#define M8B_LEN            150        /* 共记录 150 个点（150 ms） */
+#define M8B_REPEAT         10         /* 叠加次数 */
+#define M8B_RPM_TRIP       1500.0f    /* 测得转速超过它立即停速度环、iq = 0（高调制区采样问题见 M8a 文档 §4） */
 
 /* M3 电流采样参数 */
 #define M3_U_DC            1.5f   /* 直流矢量测试电压 [V] */
@@ -163,6 +180,19 @@ static volatile uint32_t   g_m7_rep    = 0;         /* 已完成的重复次数 
 static float               g_m7_id[M7_LEN];         /* 每个采样点 id 的累加和 */
 static float               g_m7_iq[M7_LEN];         /* iq 的累加和（应始终 ≈ 0） */
 static float               g_m7_vd[M7_LEN];         /* vd 指令的累加和（对照 Simulink 的电压台阶） */
+
+/* ---- M8b 速度环【Claude 代写，待复核】 ---- */
+static foc_spd_t           g_spd;                   /* 测速 + 速度 PI，只在中断里调用 step */
+static volatile int        g_spd_on    = 0;         /* 1：中断里每 M8B_DIV 个周期跑一次速度环，写 g_iq_ref */
+static volatile int        g_spd_trip  = 0;         /* 超速保护动作后置 1 */
+static volatile float      g_w_ref     = 0.0f;      /* 目标机械角速度 [rad/s] */
+static uint32_t            g_spd_div   = 0;
+static volatile int        g_m8b_run   = 0;         /* 1：目标在 LO/HI 之间切换并叠加记录 */
+static volatile uint32_t   g_m8b_n     = 0;         /* 当前在高低周期内的第几个速度环周期 */
+static volatile uint32_t   g_m8b_rep   = 0;
+static float               g_m8b_w[M8B_LEN];        /* 测得转速的累加和 [rad/s] */
+static float               g_m8b_iqr[M8B_LEN];      /* iq_ref 的累加和 [A] */
+static float               g_m8b_iq[M8B_LEN];       /* 实测 iq 的累加和 [A] */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -309,6 +339,27 @@ void cs_on_sample(const foc_abc_t *i)
       float id_ref = g_id_ref;
       uint32_t n = g_m7_n;
       if (g_m7_run) id_ref = (n < M7_STEP_AT) ? M7_ID_LO : M7_ID_HI;
+
+#if APP_MODE == APP_M8B_SPEED
+      /* 速度环【Claude 代写，待复核】：每 M8B_DIV 个周期一次，算出 iq_ref 交给本周期的电流环 */
+      if (g_spd_on && ++g_spd_div >= M8B_DIV) {
+        g_spd_div = 0;
+        uint32_t m = g_m8b_n;
+        float w_ref = g_m8b_run ? ((m < M8B_STEP_AT) ? M8B_W_LO_RPM : M8B_W_HI_RPM) * RPM_TO_RADS : g_w_ref;
+        float iq_ref = foc_spd_step(&g_spd, __HAL_TIM_GET_COUNTER(&htim4), w_ref);
+        if (fabsf(g_spd.w) > M8B_RPM_TRIP * RPM_TO_RADS) { g_spd_on = 0; g_spd_trip = 1; iq_ref = 0.0f; }
+        g_iq_ref = iq_ref;
+        if (g_m8b_run) {
+          /* 第 m 个点：g_spd.w 是本次测得的转速（过去 1 ms 的平均），iq_ref 是本次算出的指令 */
+          if (m >= M8B_STEP_AT - M8B_PRE && m < M8B_STEP_AT - M8B_PRE + M8B_LEN) {
+            uint32_t k = m - (M8B_STEP_AT - M8B_PRE);
+            g_m8b_w[k] += g_spd.w; g_m8b_iqr[k] += iq_ref; g_m8b_iq[k] += g_cur_out.iq;
+          }
+          if (++m >= M8B_PERIOD) { m = 0; if (++g_m8b_rep >= M8B_REPEAT) g_m8b_run = 0; }
+          g_m8b_n = m;
+        }
+      }
+#endif
 
       foc_abc_t     duty;
       foc_cur_out_t o;
@@ -604,8 +655,8 @@ int main(void)
     printf("---- END ----\r\n");
   }
 
-#elif APP_MODE == APP_M7_CURRENT || APP_MODE == APP_M8A_IQ_SPIN
-  /* 【Claude 代写，待复核】流程与预期结果见 docs/M7_电流闭环.md。M8a 共用 ①～④，从 ⑤ 开始不同 */
+#elif APP_MODE == APP_M7_CURRENT || APP_MODE == APP_M8A_IQ_SPIN || APP_MODE == APP_M8B_SPEED
+  /* 【Claude 代写，待复核】流程与预期结果见 docs/M7_电流闭环.md。M8a、M8b 共用 ①～④，从 ⑤ 开始不同 */
   {
     const float wbw = FOC_2PI * M7_FBW;
     const float kp  = MOTOR_L * wbw;               /* ≈ 5.53 V/A */
@@ -615,6 +666,13 @@ int main(void)
 #if APP_MODE == APP_M8A_IQ_SPIN
     printf("M8a: iq spin test. iq=%.2f A for %d ms, then iq=0 coast %d ms\r\n",
            (double)M8_IQ, M8_T_RUN_MS, M8_T_COAST_MS);
+#endif
+#if APP_MODE == APP_M8B_SPEED
+    const float wc_w = FOC_2PI * M8B_FC;
+    const float kp_w = wc_w / M8B_KT_J;            /* ≈ 0.0286 A/(rad/s) */
+    const float ki_w = kp_w * wc_w / 4.0f;         /* ≈ 2.24 A/rad */
+    printf("M8b: speed loop. Kp=%.4f A/(rad/s) Ki=%.3f A/rad, iq_max %.2f A, %.0f <-> %.0f rpm, %d repeats\r\n",
+           (double)kp_w, (double)ki_w, (double)M8B_IQ_MAX, (double)M8B_W_LO_RPM, (double)M8B_W_HI_RPM, M8B_REPEAT);
 #endif
 
     /* ① 电流采样准备：与 M3/M4 相同 */
@@ -720,6 +778,51 @@ int main(void)
     }
     if (g_fault) printf("!! OVERCURRENT TRIP\r\n");
     else         printf("---- END ----\r\n");
+#elif APP_MODE == APP_M8B_SPEED
+    /* ⑤ 速度环【Claude 代写，待复核】
+     *    a. 从静止启动到 600 rpm（开始会饱和在 iq_max），稳定 1 s，期间每 100 ms 打印一次
+     *    b. 目标 600 ↔ 700 rpm 每 200 ms 切换，按"相对阶跃时刻的位置"叠加记录 M8B_REPEAT 次
+     *    c. 停速度环、iq = 0 惯性滑行 1.5 s（电流环仍运行，不出力也不刹车），再回零矢量 */
+    for (int k = 0; k < M8B_LEN; k++) { g_m8b_w[k] = 0.0f; g_m8b_iqr[k] = 0.0f; g_m8b_iq[k] = 0.0f; }
+    foc_spd_init(&g_spd, kp_w, ki_w, 1.0f / (PWM_HZ / M8B_DIV), M8B_IQ_MAX, ENC_DIR, ENC_CPR);
+    foc_spd_reset(&g_spd, __HAL_TIM_GET_COUNTER(&htim4), 0.0f);
+    g_w_ref = M8B_W_LO_RPM * RPM_TO_RADS;
+    g_id_ref = 0.0f; g_iq_ref = 0.0f;
+    g_spd_div = 0;
+    g_spd_on = 1;                                   /* 最后一步才打开：中断看到时其余都已准备好 */
+    for (int k = 0; k < 10 && !g_fault && !g_spd_trip; k++) {
+      HAL_Delay(100);
+      printf("[5a] t=%4d ms  w=%7.1f rpm  iq_ref=%.3f A  iq=%.3f A  vq=%.2f V\r\n", (k + 1) * 100,
+             (double)(g_spd.w / RPM_TO_RADS), (double)g_iq_ref, (double)g_cur_out.iq, (double)g_cur_out.vq);
+    }
+    g_m8b_n = 0; g_m8b_rep = 0;
+    if (!g_fault && !g_spd_trip) g_m8b_run = 1;
+    while (g_m8b_run && !g_fault && !g_spd_trip) { }   /* 10 × 400 ms = 4 s */
+
+    g_spd_on = 0;
+    g_iq_ref = 0.0f;
+    HAL_Delay(1500);
+
+    /* ⑥ 结束 */
+    g_ctl_mode = CTL_IDLE;
+    {
+      const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+      pwm_set_duty(&zero);
+    }
+    if (g_fault) {
+      printf("!! OVERCURRENT TRIP\r\n");
+    } else if (g_spd_trip) {
+      printf("!! OVERSPEED TRIP (> %.0f rpm)\r\n", (double)M8B_RPM_TRIP);
+    } else {
+      printf("---- M8B STEP (k, t_ms, w_ref_rpm, w_rpm, iq_ref_A, iq_A) ; w_ref steps at k=%d ----\r\n", M8B_PRE);
+      for (int k = 0; k < M8B_LEN; k++) {
+        float ref = (k < M8B_PRE) ? M8B_W_LO_RPM : M8B_W_HI_RPM;
+        printf("%d,%d,%.0f,%.2f,%.4f,%.4f\r\n", k, k - M8B_PRE, (double)ref,
+               (double)(g_m8b_w[k] / (float)M8B_REPEAT / RPM_TO_RADS),
+               (double)(g_m8b_iqr[k] / (float)M8B_REPEAT), (double)(g_m8b_iq[k] / (float)M8B_REPEAT));
+      }
+      printf("---- END ----\r\n");
+    }
 #else
     /* ⑤ d 轴电流阶跃 LO → HI，重复叠加 */
     for (int k = 0; k < M7_LEN; k++) { g_m7_id[k] = 0.0f; g_m7_iq[k] = 0.0f; g_m7_vd[k] = 0.0f; }
@@ -744,7 +847,7 @@ int main(void)
       }
       printf("---- END ----\r\n");
     }
-#endif  /* APP_M8A_IQ_SPIN / APP_M7_CURRENT */
+#endif  /* APP_M8A_IQ_SPIN / APP_M8B_SPEED / APP_M7_CURRENT */
   }
 #endif
   /* USER CODE END 2 */

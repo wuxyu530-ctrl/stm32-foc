@@ -469,6 +469,11 @@
               <FileType>1</FileType>
               <FilePath>..\..\..\core\foc_current.c</FilePath>
             </File>
+            <File>
+              <FileName>foc_speed.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\core\foc_speed.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
