@@ -11,6 +11,7 @@ void test_svpwm_all(void);
 void test_pi_all(void);
 void test_foc_current_all(void);
 void test_foc_speed_all(void);
+void test_foc_position_all(void);
 
 static void test_sanity(void)
 {
@@ -26,6 +27,7 @@ int main(void)
     test_pi_all();
     test_foc_current_all();
     test_foc_speed_all();
+    test_foc_position_all();
 
     printf("\n===== %d 项检查，%d 项失败 =====\n",
             g_test_count, g_fail_count);

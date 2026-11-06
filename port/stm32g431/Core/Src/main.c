@@ -33,6 +33,7 @@
 #include "current_sense.h"
 #include "foc_current.h"
 #include "foc_speed.h"
+#include "foc_position.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,6 +53,8 @@
 #define APP_M7_CURRENT     7   /* 电流闭环：对齐 → 角度自检 → d 轴电流阶跃叠加平均，和 Simulink 对比 */
 #define APP_M8A_IQ_SPIN    8   /* q 轴电流测试：M7 的 ①～④ 之后给恒定 iq，电机加速再滑行，记录转速（为速度环测 ψf、J） */
 #define APP_M8B_SPEED      9   /* 速度环：M7 的 ①～④ 之后启动到 600 rpm，600 ↔ 700 rpm 阶跃叠加平均，和仿真对比 */
+#define APP_M9_POSITION    10  /* 位置环：M7 的 ①～④ 之后，0 ↔ 90° 阶跃叠加平均，再保持在 0° 让人用手推 */
+#define APP_M10_SIXSTEP    11  /* 六步换相（编码器模拟霍尔）：多档占空比测转速，抓三相电流波形，再用 FOC 同转速对比 */
 #define APP_MODE           APP_M8A_IQ_SPIN
 
 /* ---- M7 电流闭环参数【Claude 代写，待复核】见 docs/M7_电流闭环.md ---- */
@@ -89,8 +92,29 @@
 #define M8B_STEP_AT        200        /* 第 200 ms 目标从 LO 跳到 HI */
 #define M8B_PRE            20         /* 记录阶跃前 20 个点作基线 */
 #define M8B_LEN            150        /* 共记录 150 个点（150 ms） */
-#define M8B_REPEAT         10         /* 叠加次数 */
+#define M8B_REPEAT         40         /* 叠加次数（10 次时噪声约 ±4.6 rpm，40 次约 ±2.3 rpm） */
 #define M8B_RPM_TRIP       1500.0f    /* 测得转速超过它立即停速度环、iq = 0（高调制区采样问题见 M8a 文档 §4） */
+
+/* ---- M9 位置环参数【Claude 代写，待复核】见 docs/M9_位置环.md ---- */
+#define DEG2RAD            (FOC_PI / 180.0f)
+#define M9_FC              10.0f      /* 位置环穿越频率 [Hz]：Kp_pos = 2π·FC，约为速度环 50 Hz 的 1/5 */
+#define M9_W_MAX_RPM       300.0f     /* 位置环输出转速限幅 [rpm]：大阶跃时匀速走，速度环、电流环少饱和 */
+#define M9_STEP_DEG        90.0f      /* 阶跃大小 [°，机械角] */
+#define M9_PERIOD          1000       /* 一个往返周期的位置环周期数（1 kHz）：1 s */
+#define M9_STEP_AT         500        /* 第 500 ms 目标从 0 跳到 90°，周期末跳回 0 */
+#define M9_PRE             20         /* 记录阶跃前 20 个点 */
+#define M9_LEN             300        /* 共记录 300 个点（300 ms） */
+#define M9_REPEAT          10         /* 叠加次数 */
+#define M9_HOLD_S          15         /* 阶跃测试后保持在 0° 的秒数：这段时间可以用手轻推转子 */
+
+/* ---- M10 六步换相参数【Claude 代写，待复核】见 docs/M10_六步换相.md ---- */
+#define M10_N_DUTY         5
+static const float M10_DUTY[M10_N_DUTY] = { 0.08f, 0.12f, 0.16f, 0.20f, 0.24f };   /* 导通相上管占空比 */
+#define M10_RPM_TRIP       1500.0f    /* 转速超过它立即停 */
+#define M10_CAP_N          800        /* 抓波形的点数：800 × 50 µs = 40 ms */
+#define M10_BINS           72         /* 按电角度分箱平均：每 5° 一箱 */
+#define M10_BIN_MS         2000       /* 分箱累加时间 [ms]：600 rpm 时约 140 圈电角度，每箱约 500 个点 */
+#define MOTOR_PSI          0.0033f    /* 磁链 [Wb]（M8a 实测 3.1～3.3 mWb），切 FOC 时预置 vq 用 */
 
 /* M3 电流采样参数 */
 #define M3_U_DC            1.5f   /* 直流矢量测试电压 [V] */
@@ -147,7 +171,7 @@ static volatile uint32_t g_enc_cnt_at_z = 0;   /* 最近一次 Z 脉冲到来时
 static int32_t           g_enc_pos      = 0;   /* 上电以来的累计位置 [count]，处理了回绕，可正可负 */
 
 /* ---- 20 kHz 控制中断（cs_on_sample）与主循环共享的状态 ---- */
-typedef enum { CTL_IDLE = 0, CTL_HOLD, CTL_ROTATE, CTL_CURRENT } ctl_mode_t;
+typedef enum { CTL_IDLE = 0, CTL_HOLD, CTL_ROTATE, CTL_CURRENT, CTL_SIXSTEP } ctl_mode_t;
 static volatile ctl_mode_t g_ctl_mode  = CTL_IDLE;  /* IDLE：中断里不写 CCR */
 static volatile float      g_ctl_ud    = 0.0f;
 static volatile float      g_ctl_uq    = 0.0f;
@@ -193,6 +217,35 @@ static volatile uint32_t   g_m8b_rep   = 0;
 static float               g_m8b_w[M8B_LEN];        /* 测得转速的累加和 [rad/s] */
 static float               g_m8b_iqr[M8B_LEN];      /* iq_ref 的累加和 [A] */
 static float               g_m8b_iq[M8B_LEN];       /* 实测 iq 的累加和 [A] */
+
+#if APP_MODE == APP_M9_POSITION
+/* ---- M9 位置环【Claude 代写，待复核】 ---- */
+static foc_pos_t           g_pos;
+static volatile int        g_pos_on    = 0;         /* 1：速度环的 ω_ref 由位置环给 */
+static volatile float      g_theta_ref = 0.0f;      /* 目标位置 [rad，机械角，相对位置环 reset 时刻] */
+static volatile int        g_m9_run    = 0;
+static volatile uint32_t   g_m9_n      = 0;
+static volatile uint32_t   g_m9_rep    = 0;
+static float               g_m9_th[M9_LEN];         /* 实测位置的累加和 [rad] */
+static float               g_m9_w[M9_LEN];          /* 测得转速的累加和 [rad/s] */
+static float               g_m9_iqr[M9_LEN];        /* iq_ref 的累加和 [A] */
+#endif
+
+#if APP_MODE == APP_M10_SIXSTEP
+/* ---- M10 六步换相【Claude 代写，待复核】 ---- */
+static volatile float      g_6s_duty   = 0.0f;      /* 导通相上管占空比 */
+static volatile int        g_6s_sector = -1;
+static volatile float      g_6s_iq_sum = 0.0f;      /* 主循环清零，中断累加，用来算平均 iq */
+static volatile uint32_t   g_6s_iq_cnt = 0;
+static volatile int        g_cap_run   = 0;         /* 1：中断里抓一段 20 kHz 的电流波形 */
+static volatile uint32_t   g_cap_n     = 0;
+static int16_t             g_cap[M10_CAP_N][6];     /* ia, ib, ic, id, iq [mA]，θe [0.1°] */
+/* 空载时稳态电流只有 ~25 mA，单点噪声 ±120 mA，原始波形看不清。
+ * 按电角度分箱平均：同一电角度的点跨很多圈取平均，噪声降到 ~1/√(每箱点数)。 */
+static volatile int        g_bin_run   = 0;
+static float               g_bin[M10_BINS][4];      /* ia, ib, ic, iq 的累加和 [A] */
+static uint32_t            g_bin_cnt[M10_BINS];
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -282,6 +335,113 @@ static float theta_e_from_encoder(void)
   return FOC_2PI * e;
 }
 
+#if APP_MODE == APP_M10_SIXSTEP
+/* ---- 六步换相【Claude 代写，待复核】见 docs/M10_六步换相.md ----
+ * 扇区 s 由电角度决定：s = floor((θe + 30°) / 60°)，s = 0 对应 θe ∈ [−30°, 30°)。
+ * 每个扇区选一个超前转子 60°～120° 的电流方向：一相上管 PWM（"进"）、一相下管常开（"出"）、一相悬空。
+ *   s : 0    1    2    3    4    5
+ *   进: B    B    C    C    A    A
+ *   出: C    A    A    B    B    C
+ * 悬空相：CCxE、CCxNE 都清零，配合 BDTR.OSSR = 1，上下管都输出无效电平（都关）。 */
+static const uint8_t SIX_HI[6] = { 1, 1, 2, 2, 0, 0 };   /* 0 = A，1 = B，2 = C */
+static const uint8_t SIX_LO[6] = { 2, 0, 0, 1, 1, 2 };
+#define CCER_PHASE_BITS(k)  ((TIM_CCER_CC1E | TIM_CCER_CC1NE) << (4u * (k)))
+#define CCER_ALL3           (CCER_PHASE_BITS(0) | CCER_PHASE_BITS(1) | CCER_PHASE_BITS(2))
+
+static void sixstep_apply(int s, float d)
+{
+  uint32_t ccr[3] = { 0, 0, 0 };                   /* 出相、悬空相：CCR = 0 → 上管不开（出相下管常开） */
+  ccr[SIX_HI[s]] = (uint32_t)(d * TIM1_ARR + 0.5f);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr[0]);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr[1]);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr[2]);
+  if (s != g_6s_sector) {                          /* 只在换相时改输出使能 */
+    uint32_t en = CCER_PHASE_BITS(SIX_HI[s]) | CCER_PHASE_BITS(SIX_LO[s]);
+    TIM1->CCER = (TIM1->CCER & ~CCER_ALL3) | en;
+    g_6s_sector = s;
+  }
+}
+
+/* 退出六步：三相输出全部重新使能（之后由电流环写占空比） */
+static void sixstep_outputs_all_on(void)
+{
+  TIM1->CCER |= CCER_ALL3;
+  g_6s_sector = -1;
+}
+
+static int16_t to_milli(float x)
+{
+  float v = x * 1000.0f;
+  if (v >  32000.0f) v =  32000.0f;
+  if (v < -32000.0f) v = -32000.0f;
+  return (int16_t)v;
+}
+
+static void cap_store(const foc_abc_t *i, float id, float iq, float th)
+{
+  if (!g_cap_run) return;
+  uint32_t k = g_cap_n;
+  g_cap[k][0] = to_milli(i->a); g_cap[k][1] = to_milli(i->b); g_cap[k][2] = to_milli(i->c);
+  g_cap[k][3] = to_milli(id);   g_cap[k][4] = to_milli(iq);
+  g_cap[k][5] = (int16_t)(th * 1800.0f / FOC_PI);  /* 0.1° */
+  if (++k >= M10_CAP_N) g_cap_run = 0;
+  g_cap_n = k;
+}
+
+static void bin_store(const foc_abc_t *i, float iq, float th)
+{
+  if (!g_bin_run) return;
+  int b = (int)(th * (float)M10_BINS / FOC_2PI);
+  if (b < 0) b = 0;
+  if (b >= M10_BINS) b = M10_BINS - 1;
+  g_bin[b][0] += i->a; g_bin[b][1] += i->b; g_bin[b][2] += i->c; g_bin[b][3] += iq;
+  g_bin_cnt[b]++;
+}
+
+static void bin_collect(uint32_t ms)
+{
+  for (int b = 0; b < M10_BINS; b++) { g_bin[b][0] = g_bin[b][1] = g_bin[b][2] = g_bin[b][3] = 0.0f; g_bin_cnt[b] = 0; }
+  g_bin_run = 1;
+  HAL_Delay(ms);
+  g_bin_run = 0;
+}
+
+static void print_bins(const char *title)
+{
+  printf("---- %s (th_e_deg, n, ia_mA, ib_mA, ic_mA, iq_mA) ----\r\n", title);
+  for (int b = 0; b < M10_BINS; b++) {
+    float n = (g_bin_cnt[b] > 0) ? (float)g_bin_cnt[b] : 1.0f;
+    printf("%d,%lu,%.1f,%.1f,%.1f,%.1f\r\n", b * 360 / M10_BINS + 360 / M10_BINS / 2, (unsigned long)g_bin_cnt[b],
+           (double)(g_bin[b][0] / n * 1000.0f), (double)(g_bin[b][1] / n * 1000.0f),
+           (double)(g_bin[b][2] / n * 1000.0f), (double)(g_bin[b][3] / n * 1000.0f));
+  }
+  printf("---- END BINS ----\r\n");
+}
+
+/* 主循环里测平均转速 [rpm]：每 1 ms 读一次编码器，取 ms 毫秒内的位置差。
+ * 第一次 enc_update 可能因为上次调用太久以前而算错一圈，所以起点取在它之后。 */
+static float measure_rpm(uint32_t ms)
+{
+  enc_update();
+  int32_t  p0 = g_enc_pos;
+  uint32_t t0 = HAL_GetTick(), last = t0;
+  while (HAL_GetTick() - t0 < ms) {
+    uint32_t now = HAL_GetTick();
+    if (now != last) { last = now; enc_update(); }
+  }
+  return (float)(ENC_DIR * (g_enc_pos - p0)) / (float)ENC_CPR / ((float)ms * 1e-3f) * 60.0f;
+}
+
+static void print_capture(const char *title)
+{
+  printf("---- %s (k, t_us, ia_mA, ib_mA, ic_mA, id_mA, iq_mA, th_e_0.1deg) ----\r\n", title);
+  for (int k = 0; k < M10_CAP_N; k++)
+    printf("%d,%d,%d,%d,%d,%d,%d,%d\r\n", k, k * 50, g_cap[k][0], g_cap[k][1], g_cap[k][2],
+           g_cap[k][3], g_cap[k][4], g_cap[k][5]);
+  printf("---- END CAPTURE ----\r\n");
+}
+#endif
+
 /* ---- 20 kHz 控制中断：每个 PWM 周期 ADC 采完三相后由 current_sense.c 调用 ---- */
 void cs_on_sample(const foc_abc_t *i)
 {
@@ -340,13 +500,20 @@ void cs_on_sample(const foc_abc_t *i)
       uint32_t n = g_m7_n;
       if (g_m7_run) id_ref = (n < M7_STEP_AT) ? M7_ID_LO : M7_ID_HI;
 
-#if APP_MODE == APP_M8B_SPEED
-      /* 速度环【Claude 代写，待复核】：每 M8B_DIV 个周期一次，算出 iq_ref 交给本周期的电流环 */
+#if APP_MODE == APP_M8B_SPEED || APP_MODE == APP_M9_POSITION || APP_MODE == APP_M10_SIXSTEP
+      /* 速度环【Claude 代写，待复核】：每 M8B_DIV 个周期一次，算出 iq_ref 交给本周期的电流环。
+       * M9：ω_ref 由位置环给（位置环和速度环同为 1 kHz，读同一个编码器计数） */
       if (g_spd_on && ++g_spd_div >= M8B_DIV) {
         g_spd_div = 0;
+        uint32_t cnt = __HAL_TIM_GET_COUNTER(&htim4);
         uint32_t m = g_m8b_n;
         float w_ref = g_m8b_run ? ((m < M8B_STEP_AT) ? M8B_W_LO_RPM : M8B_W_HI_RPM) * RPM_TO_RADS : g_w_ref;
-        float iq_ref = foc_spd_step(&g_spd, __HAL_TIM_GET_COUNTER(&htim4), w_ref);
+#if APP_MODE == APP_M9_POSITION
+        uint32_t q = g_m9_n;
+        float th_ref = g_m9_run ? ((q < M9_STEP_AT) ? 0.0f : M9_STEP_DEG * DEG2RAD) : g_theta_ref;
+        if (g_pos_on) w_ref = foc_pos_step(&g_pos, cnt, th_ref);
+#endif
+        float iq_ref = foc_spd_step(&g_spd, cnt, w_ref);
         if (fabsf(g_spd.w) > M8B_RPM_TRIP * RPM_TO_RADS) { g_spd_on = 0; g_spd_trip = 1; iq_ref = 0.0f; }
         g_iq_ref = iq_ref;
         if (g_m8b_run) {
@@ -358,6 +525,17 @@ void cs_on_sample(const foc_abc_t *i)
           if (++m >= M8B_PERIOD) { m = 0; if (++g_m8b_rep >= M8B_REPEAT) g_m8b_run = 0; }
           g_m8b_n = m;
         }
+#if APP_MODE == APP_M9_POSITION
+        if (g_m9_run) {
+          /* 第 q 个点：g_pos.theta 是本次测得的位置，g_spd.w 是本次测得的转速 */
+          if (q >= M9_STEP_AT - M9_PRE && q < M9_STEP_AT - M9_PRE + M9_LEN) {
+            uint32_t k = q - (M9_STEP_AT - M9_PRE);
+            g_m9_th[k] += g_pos.theta; g_m9_w[k] += g_spd.w; g_m9_iqr[k] += iq_ref;
+          }
+          if (++q >= M9_PERIOD) { q = 0; if (++g_m9_rep >= M9_REPEAT) g_m9_run = 0; }
+          g_m9_n = q;
+        }
+#endif
       }
 #endif
 
@@ -366,6 +544,10 @@ void cs_on_sample(const foc_abc_t *i)
       foc_cur_step(&g_cur, i, &sc, id_ref, g_iq_ref, &duty, &o);
       pwm_set_duty(&duty);                           /* 下一个更新事件生效（约半个周期后） */
       g_cur_out.id = o.id; g_cur_out.iq = o.iq; g_cur_out.vd = o.vd; g_cur_out.vq = o.vq;
+#if APP_MODE == APP_M10_SIXSTEP
+      cap_store(i, o.id, o.iq, th);                  /* M10：FOC 对照组的电流波形 */
+      bin_store(i, o.iq, th);
+#endif
 
       if (g_m7_run) {
         /* 第 n 个样本里：o.id 是本次采到的电流，o.vd 是本次算出、下个周期才生效的电压 */
@@ -383,6 +565,26 @@ void cs_on_sample(const foc_abc_t *i)
       }
       break;
     }
+#if APP_MODE == APP_M10_SIXSTEP
+    case CTL_SIXSTEP: {                              /* M10 六步换相【Claude 代写，待复核】 */
+      float th = theta_e_from_encoder();
+      g_theta_e = th;
+      int s = (int)((th + FOC_PI / 6.0f) / (FOC_PI / 3.0f));   /* θe ∈ [0, 2π) → 0..6，6 即 0 */
+      if (s >= 6) s -= 6;
+      sixstep_apply(s, g_6s_duty);
+
+      /* 用编码器角度把三相电流投影到 dq：iq 正比于转矩，用来看六步换相的转矩脉动 */
+      foc_ab_t ab; foc_dq_t dq; foc_sincos_t sc;
+      foc_clarke(i, &ab);
+      foc_sincos(th, &sc);
+      foc_park(&ab, &sc, &dq);
+      g_cur_out.id = dq.d; g_cur_out.iq = dq.q;
+      g_6s_iq_sum += dq.q; g_6s_iq_cnt++;
+      cap_store(i, dq.d, dq.q, th);
+      bin_store(i, dq.q, th);
+      break;
+    }
+#endif
     default:
       break;
   }
@@ -655,8 +857,9 @@ int main(void)
     printf("---- END ----\r\n");
   }
 
-#elif APP_MODE == APP_M7_CURRENT || APP_MODE == APP_M8A_IQ_SPIN || APP_MODE == APP_M8B_SPEED
-  /* 【Claude 代写，待复核】流程与预期结果见 docs/M7_电流闭环.md。M8a、M8b 共用 ①～④，从 ⑤ 开始不同 */
+#elif APP_MODE == APP_M7_CURRENT || APP_MODE == APP_M8A_IQ_SPIN || APP_MODE == APP_M8B_SPEED || \
+      APP_MODE == APP_M9_POSITION || APP_MODE == APP_M10_SIXSTEP
+  /* 【Claude 代写，待复核】流程与预期结果见 docs/M7_电流闭环.md。M8a、M8b、M9、M10 共用 ①～④，从 ⑤ 开始不同 */
   {
     const float wbw = FOC_2PI * M7_FBW;
     const float kp  = MOTOR_L * wbw;               /* ≈ 5.53 V/A */
@@ -667,12 +870,21 @@ int main(void)
     printf("M8a: iq spin test. each iq up to %d ms or %.0f rpm, then iq=0 coast %d ms\r\n",
            M8_T_RUN_MS, (double)M8_RPM_MAX, M8_T_COAST_MS);
 #endif
-#if APP_MODE == APP_M8B_SPEED
+#if APP_MODE == APP_M8B_SPEED || APP_MODE == APP_M9_POSITION || APP_MODE == APP_M10_SIXSTEP
     const float wc_w = FOC_2PI * M8B_FC;
     const float kp_w = wc_w / M8B_KT_J;            /* ≈ 0.0286 A/(rad/s) */
     const float ki_w = kp_w * wc_w / 4.0f;         /* ≈ 2.24 A/rad */
     printf("M8b: speed loop. Kp=%.4f A/(rad/s) Ki=%.3f A/rad, iq_max %.2f A, %.0f <-> %.0f rpm, %d repeats\r\n",
            (double)kp_w, (double)ki_w, (double)M8B_IQ_MAX, (double)M8B_W_LO_RPM, (double)M8B_W_HI_RPM, M8B_REPEAT);
+#endif
+#if APP_MODE == APP_M9_POSITION
+    const float kp_pos = FOC_2PI * M9_FC;          /* ≈ 62.8 (rad/s)/rad */
+    printf("M9: position loop. Kp_pos=%.1f (rad/s)/rad, w_max %.0f rpm, step 0 <-> %.0f deg, %d repeats, hold %d s\r\n",
+           (double)kp_pos, (double)M9_W_MAX_RPM, (double)M9_STEP_DEG, M9_REPEAT, M9_HOLD_S);
+#endif
+#if APP_MODE == APP_M10_SIXSTEP
+    printf("M10: six-step (encoder-emulated Hall), %d duty levels up to %.2f, then FOC at same speed\r\n",
+           M10_N_DUTY, (double)M10_DUTY[M10_N_DUTY - 1]);
 #endif
 
     /* ① 电流采样准备：与 M3/M4 相同 */
@@ -828,6 +1040,129 @@ int main(void)
       }
       printf("---- END ----\r\n");
     }
+#elif APP_MODE == APP_M9_POSITION
+    /* ⑤ 位置环【Claude 代写，待复核】见 docs/M9_位置环.md
+     *    a. 位置环 + 速度环接管，以当前位置为 0°，保持 0.5 s
+     *    b. 目标 0 ↔ 90° 每 500 ms 切换，按"相对阶跃时刻的位置"叠加记录 M9_REPEAT 次
+     *    c. 保持在 0° 共 M9_HOLD_S 秒，每 100 ms 打印位置误差和 iq_ref：这段时间可用手轻推转子
+     *    d. 停：iq = 0 → 零矢量，输出 CSV */
+    for (int k = 0; k < M9_LEN; k++) { g_m9_th[k] = 0.0f; g_m9_w[k] = 0.0f; g_m9_iqr[k] = 0.0f; }
+    foc_spd_init(&g_spd, kp_w, ki_w, 1.0f / (PWM_HZ / M8B_DIV), M8B_IQ_MAX, ENC_DIR, ENC_CPR);
+    foc_pos_init(&g_pos, kp_pos, M9_W_MAX_RPM * RPM_TO_RADS, ENC_DIR, ENC_CPR);
+    {
+      uint32_t c = __HAL_TIM_GET_COUNTER(&htim4);
+      foc_spd_reset(&g_spd, c, 0.0f);
+      foc_pos_reset(&g_pos, c);
+    }
+    g_theta_ref = 0.0f; g_w_ref = 0.0f;
+    g_id_ref = 0.0f; g_iq_ref = 0.0f;
+    g_spd_div = 0;
+    g_pos_on = 1;
+    g_spd_on = 1;                                   /* 最后打开：中断看到时其余都已准备好 */
+    HAL_Delay(500);
+    printf("[5a] hold 0 deg: theta=%.2f deg  iq_ref=%.3f A\r\n", (double)(g_pos.theta / DEG2RAD), (double)g_iq_ref);
+
+    g_m9_n = 0; g_m9_rep = 0;
+    if (!g_fault && !g_spd_trip) g_m9_run = 1;
+    while (g_m9_run && !g_fault && !g_spd_trip) { }   /* 10 × 1 s */
+    g_theta_ref = 0.0f;
+
+    printf("[5c] hold 0 deg for %d s -- you may push the rotor gently now (t_s, err_deg, w_rpm, iq_ref_A)\r\n", M9_HOLD_S);
+    for (int k = 0; k < M9_HOLD_S * 10 && !g_fault && !g_spd_trip; k++) {
+      HAL_Delay(100);
+      printf("%d.%d,%.2f,%.1f,%.3f\r\n", (k + 1) / 10, (k + 1) % 10, (double)(g_pos.theta / DEG2RAD),
+             (double)(g_spd.w / RPM_TO_RADS), (double)g_iq_ref);
+    }
+
+    g_pos_on = 0;
+    g_spd_on = 0;
+    g_iq_ref = 0.0f;
+    HAL_Delay(300);
+    g_ctl_mode = CTL_IDLE;
+    {
+      const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+      pwm_set_duty(&zero);
+    }
+    if (g_fault) {
+      printf("!! OVERCURRENT TRIP\r\n");
+    } else if (g_spd_trip) {
+      printf("!! OVERSPEED TRIP (> %.0f rpm)\r\n", (double)M8B_RPM_TRIP);
+    } else {
+      printf("---- M9 STEP (k, t_ms, th_ref_deg, th_deg, w_rpm, iq_ref_A) ; th_ref steps at k=%d ----\r\n", M9_PRE);
+      for (int k = 0; k < M9_LEN; k++) {
+        float ref = (k < M9_PRE) ? 0.0f : M9_STEP_DEG;
+        printf("%d,%d,%.0f,%.3f,%.2f,%.4f\r\n", k, k - M9_PRE, (double)ref,
+               (double)(g_m9_th[k] / (float)M9_REPEAT / DEG2RAD),
+               (double)(g_m9_w[k] / (float)M9_REPEAT / RPM_TO_RADS),
+               (double)(g_m9_iqr[k] / (float)M9_REPEAT));
+      }
+      printf("---- END ----\r\n");
+    }
+#elif APP_MODE == APP_M10_SIXSTEP
+    /* ⑤ 六步换相【Claude 代写，待复核】见 docs/M10_六步换相.md
+     *    a. 切到六步换相（扇区由编码器电角度决定），占空比逐档加大，每档测平均转速和平均 iq
+     *    b. 最后一档抓 40 ms 三相电流波形
+     *    c. 无缝切到 FOC 速度环，目标 = 六步测得的转速（预置 vq = 反电动势，避免切换时电流冲击），
+     *       稳定后再抓 40 ms 波形作对照
+     *    d. 停：iq = 0 滑行 → 零矢量 */
+    float rpm_6s = 0.0f;
+    int   abort6 = 0;
+    TIM1->BDTR |= TIM_BDTR_OSSR;                    /* 悬空相 CCxE = CCxNE = 0 时输出无效电平（上下管都关） */
+    g_6s_sector = -1;
+    g_6s_duty = M10_DUTY[0];
+    g_ctl_mode = CTL_SIXSTEP;
+    printf("[5a] six-step levels (duty, rpm, iq_mean_A)\r\n");
+    for (int k = 0; k < M10_N_DUTY && !g_fault; k++) {
+      g_6s_duty = M10_DUTY[k];
+      HAL_Delay(700);
+      g_6s_iq_sum = 0.0f; g_6s_iq_cnt = 0;
+      rpm_6s = measure_rpm(800);
+      float iq_mean = (g_6s_iq_cnt > 0) ? g_6s_iq_sum / (float)g_6s_iq_cnt : 0.0f;
+      printf("%.2f,%.1f,%.4f\r\n", (double)g_6s_duty, (double)rpm_6s, (double)iq_mean);
+      if (fabsf(rpm_6s) > M10_RPM_TRIP) { abort6 = 1; break; }
+    }
+    if (!g_fault && !abort6) {
+      bin_collect(M10_BIN_MS);                      /* 六步：按电角度分箱平均 2 s */
+      g_cap_n = 0; g_cap_run = 1;                   /* 六步：原始波形 40 ms */
+      while (g_cap_run && !g_fault) { }
+    }
+
+    /* ⑤c 切到 FOC：先把电流环、速度环的积分预置好，再关中断一次性切换模式 */
+    float w0     = rpm_6s * RPM_TO_RADS;
+    float iq_ff  = (fabsf(rpm_6s) > 10.0f) ? 0.025f : 0.0f;          /* 约等于摩擦需要的 iq */
+    foc_cur_reset(&g_cur);
+    g_cur.pi_q.integ = MOTOR_R * iq_ff + MOTOR_POLE_PAIRS * w0 * MOTOR_PSI;   /* vq ≈ R·iq + ωe·ψf */
+    foc_spd_init(&g_spd, kp_w, ki_w, 1.0f / (PWM_HZ / M8B_DIV), M8B_IQ_MAX, ENC_DIR, ENC_CPR);
+    foc_spd_reset(&g_spd, __HAL_TIM_GET_COUNTER(&htim4), iq_ff);
+    g_w_ref = w0; g_id_ref = 0.0f; g_iq_ref = iq_ff;
+    g_spd_div = 0;
+    __disable_irq();
+    sixstep_outputs_all_on();
+    g_ctl_mode = CTL_CURRENT;
+    g_spd_on = (!g_fault && !abort6) ? 1 : 0;
+    __enable_irq();
+
+    if (!g_fault && !abort6) {
+      print_bins("M10 SIXSTEP BINS");               /* 打印期间 FOC 已在运行并稳定下来 */
+      print_capture("M10 SIXSTEP");
+      printf("[5c] FOC at %.1f rpm: measured %.1f rpm\r\n", (double)rpm_6s, (double)measure_rpm(800));
+      bin_collect(M10_BIN_MS);                      /* FOC：同样分箱平均 2 s */
+      g_cap_n = 0; g_cap_run = 1;
+      while (g_cap_run && !g_fault) { }
+    }
+
+    g_spd_on = 0;
+    g_iq_ref = 0.0f;
+    if (!g_fault && !abort6) { print_bins("M10 FOC BINS"); print_capture("M10 FOC"); }
+    HAL_Delay(1500);
+    g_ctl_mode = CTL_IDLE;
+    {
+      const foc_abc_t zero = { 0.5f, 0.5f, 0.5f };
+      pwm_set_duty(&zero);
+    }
+    if (g_fault)      printf("!! OVERCURRENT TRIP\r\n");
+    else if (abort6)  printf("!! OVERSPEED in six-step (> %.0f rpm)\r\n", (double)M10_RPM_TRIP);
+    else              printf("---- END ----\r\n");
 #else
     /* ⑤ d 轴电流阶跃 LO → HI，重复叠加 */
     for (int k = 0; k < M7_LEN; k++) { g_m7_id[k] = 0.0f; g_m7_iq[k] = 0.0f; g_m7_vd[k] = 0.0f; }
@@ -852,7 +1187,7 @@ int main(void)
       }
       printf("---- END ----\r\n");
     }
-#endif  /* APP_M8A_IQ_SPIN / APP_M8B_SPEED / APP_M7_CURRENT */
+#endif  /* APP_M8A_IQ_SPIN / APP_M8B_SPEED / APP_M9_POSITION / APP_M10_SIXSTEP / APP_M7_CURRENT */
   }
 #endif
   /* USER CODE END 2 */
