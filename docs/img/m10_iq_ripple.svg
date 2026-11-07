@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" font-family="Noto Sans SC, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">
+<rect width="640" height="360" fill="#ffffff"/>
+<text x="64" y="24" font-size="15" font-weight="700" fill="#1d2422">同转速（677 rpm）下转矩电流 iq：六步换相 vs FOC</text>
+<line x1="64.0" y1="40" x2="64.0" y2="308" stroke="#e3e6e4"/>
+<text x="64.0" y="324" text-anchor="middle" fill="#8a8f8c">0</text>
+<line x1="156.7" y1="40" x2="156.7" y2="308" stroke="#e3e6e4"/>
+<text x="156.7" y="324" text-anchor="middle" fill="#8a8f8c">10</text>
+<line x1="249.3" y1="40" x2="249.3" y2="308" stroke="#e3e6e4"/>
+<text x="249.3" y="324" text-anchor="middle" fill="#8a8f8c">20</text>
+<line x1="342.0" y1="40" x2="342.0" y2="308" stroke="#e3e6e4"/>
+<text x="342.0" y="324" text-anchor="middle" fill="#8a8f8c">30</text>
+<line x1="434.7" y1="40" x2="434.7" y2="308" stroke="#e3e6e4"/>
+<text x="434.7" y="324" text-anchor="middle" fill="#8a8f8c">40</text>
+<line x1="527.3" y1="40" x2="527.3" y2="308" stroke="#e3e6e4"/>
+<text x="527.3" y="324" text-anchor="middle" fill="#8a8f8c">50</text>
+<line x1="620.0" y1="40" x2="620.0" y2="308" stroke="#e3e6e4"/>
+<text x="620.0" y="324" text-anchor="middle" fill="#8a8f8c">60</text>
+<line x1="64" y1="308.0" x2="620" y2="308.0" stroke="#e3e6e4"/>
+<text x="56" y="312.0" text-anchor="end" fill="#8a8f8c">0</text>
+<line x1="64" y1="248.4" x2="620" y2="248.4" stroke="#e3e6e4"/>
+<text x="56" y="252.4" text-anchor="end" fill="#8a8f8c">10</text>
+<line x1="64" y1="188.9" x2="620" y2="188.9" stroke="#e3e6e4"/>
+<text x="56" y="192.9" text-anchor="end" fill="#8a8f8c">20</text>
+<line x1="64" y1="129.3" x2="620" y2="129.3" stroke="#e3e6e4"/>
+<text x="56" y="133.3" text-anchor="end" fill="#8a8f8c">30</text>
+<line x1="64" y1="69.8" x2="620" y2="69.8" stroke="#e3e6e4"/>
+<text x="56" y="73.8" text-anchor="end" fill="#8a8f8c">40</text>
+<rect x="64" y="40" width="556" height="268" fill="none" stroke="#8a8f8c"/>
+<text x="342.0" y="348" text-anchor="middle" fill="#1d2422">距上次换相的电角度 (°)</text>
+<text x="16" y="174.0" text-anchor="middle" fill="#1d2422" transform="rotate(-90 16 174.0)">iq (mA)</text>
+<circle cx="87.2" cy="144.0" r="2.6" fill="#e07b00"/>
+<circle cx="133.5" cy="144.8" r="2.6" fill="#e07b00"/>
+<circle cx="179.8" cy="130.7" r="2.6" fill="#e07b00"/>
+<circle cx="226.2" cy="158.7" r="2.6" fill="#e07b00"/>
+<circle cx="272.5" cy="194.8" r="2.6" fill="#e07b00"/>
+<circle cx="318.8" cy="227.8" r="2.6" fill="#e07b00"/>
+<circle cx="365.2" cy="247.1" r="2.6" fill="#e07b00"/>
+<circle cx="411.5" cy="248.3" r="2.6" fill="#e07b00"/>
+<circle cx="457.8" cy="228.3" r="2.6" fill="#e07b00"/>
+<circle cx="504.2" cy="187.4" r="2.6" fill="#e07b00"/>
+<circle cx="550.5" cy="133.8" r="2.6" fill="#e07b00"/>
+<circle cx="596.8" cy="63.5" r="2.6" fill="#e07b00"/>
+<polyline points="87.2,144.0 133.5,144.8 179.8,130.7 226.2,158.7 272.5,194.8 318.8,227.8 365.2,247.1 411.5,248.3 457.8,228.3 504.2,187.4 550.5,133.8 596.8,63.5" fill="none" stroke="#e07b00" stroke-width="2"/>
+<line x1="420" y1="50" x2="444" y2="50" stroke="#e07b00" stroke-width="2.5"/>
+<text x="450" y="54" fill="#1d2422">六步换相</text>
+<circle cx="87.2" cy="168.4" r="2.6" fill="#1f5fbf"/>
+<circle cx="133.5" cy="170.1" r="2.6" fill="#1f5fbf"/>
+<circle cx="179.8" cy="168.7" r="2.6" fill="#1f5fbf"/>
+<circle cx="226.2" cy="174.8" r="2.6" fill="#1f5fbf"/>
+<circle cx="272.5" cy="174.9" r="2.6" fill="#1f5fbf"/>
+<circle cx="318.8" cy="172.3" r="2.6" fill="#1f5fbf"/>
+<circle cx="365.2" cy="170.9" r="2.6" fill="#1f5fbf"/>
+<circle cx="411.5" cy="176.3" r="2.6" fill="#1f5fbf"/>
+<circle cx="457.8" cy="163.2" r="2.6" fill="#1f5fbf"/>
+<circle cx="504.2" cy="169.0" r="2.6" fill="#1f5fbf"/>
+<circle cx="550.5" cy="164.6" r="2.6" fill="#1f5fbf"/>
+<circle cx="596.8" cy="171.8" r="2.6" fill="#1f5fbf"/>
+<polyline points="87.2,168.4 133.5,170.1 179.8,168.7 226.2,174.8 272.5,174.9 318.8,172.3 365.2,170.9 411.5,176.3 457.8,163.2 504.2,169.0 550.5,164.6 596.8,171.8" fill="none" stroke="#1f5fbf" stroke-width="2"/>
+<line x1="420" y1="68" x2="444" y2="68" stroke="#1f5fbf" stroke-width="2.5"/>
+<text x="450" y="72" fill="#1d2422">FOC</text>
+<text x="230.8" y="272.3" fill="#8a8f8c" font-size="11.5">扇区中间：线反电动势最大，电流被压低</text>
+</svg>
