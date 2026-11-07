@@ -55,7 +55,7 @@
 #define APP_M8B_SPEED      9   /* 速度环：M7 的 ①～④ 之后启动到 600 rpm，600 ↔ 700 rpm 阶跃叠加平均，和仿真对比 */
 #define APP_M9_POSITION    10  /* 位置环：M7 的 ①～④ 之后，0 ↔ 90° 阶跃叠加平均，再保持在 0° 让人用手推 */
 #define APP_M10_SIXSTEP    11  /* 六步换相（编码器模拟霍尔）：多档占空比测转速，抓三相电流波形，再用 FOC 同转速对比 */
-#define APP_MODE           APP_M8A_IQ_SPIN
+#define APP_MODE           APP_M10_SIXSTEP
 
 /* ---- M7 电流闭环参数【Claude 代写，待复核】见 docs/M7_电流闭环.md ---- */
 #define MOTOR_R            3.21f      /* 相电阻 [Ω]，M4b */
