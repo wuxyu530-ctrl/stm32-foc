@@ -85,7 +85,7 @@
 #define M8B_KT_J           1.1e4f     /* Kt/J [rad/(s²·A)]，M8a 实测 */
 #define M8B_FC             50.0f      /* 速度环穿越频率 [Hz]：Kp = 2π·FC/(Kt/J)，Ki = Kp·2π·FC/4 */
 #define M8B_DIV            20         /* 每 20 个 PWM 周期跑一次速度环 → Ts = 1 ms */
-#define M8B_IQ_MAX         0.4f       /* iq_ref 限幅 [A] */
+#define M8B_IQ_MAX         0.4f       /* iq_ref 限幅 [A]：低于电机额定 0.5 A，保守取值；决定最大加减速度 ≈ (Kt/J)·0.4 ≈ 4400 rad/s² */
 #define M8B_W_LO_RPM       600.0f     /* 阶跃前目标转速 [rpm] */
 #define M8B_W_HI_RPM       700.0f     /* 阶跃后 [rpm]。Kp × 100 rpm ≈ 0.30 A < iq_max，线性区 */
 #define M8B_PERIOD         400        /* 一个高低周期的速度环周期数：400 ms */
