@@ -15,3 +15,6 @@ __pycache__/
 build/
 *.log
 *.scvd
+
+# 个人学习记录，只保留在本地
+docs/理解清单.md
