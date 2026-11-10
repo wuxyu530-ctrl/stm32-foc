@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    transform.h
  * @brief   FOC 坐标变换：Clarke / Park 及其逆变换

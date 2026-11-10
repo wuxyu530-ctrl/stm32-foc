@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    foc_current.h
  * @brief   dq 电流环：一个控制周期的完整计算（平台无关）

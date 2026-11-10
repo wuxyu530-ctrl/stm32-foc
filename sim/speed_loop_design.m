@@ -1,3 +1,4 @@
+% SPDX-License-Identifier: MIT
 %% 速度环设计验证（Control System Toolbox）
 % 对应 docs/M8b_速度环.md：
 %   被控对象 iq -> w = (Kt/J)/(s + B/J)（M8a 实测），电流环看成一阶滞后

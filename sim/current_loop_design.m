@@ -1,3 +1,4 @@
+% SPDX-License-Identifier: MIT
 %% 电流环设计验证（第一阶段：只用 Control System Toolbox，不用 Simulink）
 % 验证 docs/电流环控制基础.md 中的手算结果：
 %   Kp = L*w_bw, Ki = R*w_bw；相位裕度 = 90° - 360°*f_bw*Td；无稳态误差

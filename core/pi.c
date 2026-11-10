@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    pi.c
  * @brief   离散 PI 控制器的实现

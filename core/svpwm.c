@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    svpwm.c
  * @brief   七段式 SVPWM 的实现

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    foc_position.h
  * @brief   位置环：编码器累计位置 + 位置 P 控制（平台无关）

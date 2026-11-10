@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    current_sense.h
  * @brief   三电阻低边电流采样（B-G431B-ESC1 板级）

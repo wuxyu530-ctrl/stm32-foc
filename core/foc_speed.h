@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    foc_speed.h
  * @brief   速度环：编码器测速 + 速度 PI（平台无关）

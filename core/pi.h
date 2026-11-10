@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    pi.h
  * @brief   离散 PI 控制器：输出限幅 + 钳位抗积分饱和

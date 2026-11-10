@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    svpwm.h
  * @brief   空间矢量脉宽调制 (Space Vector PWM)，七段式

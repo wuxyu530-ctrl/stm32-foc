@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    transform.c
  * @brief   FOC 坐标变换的实现

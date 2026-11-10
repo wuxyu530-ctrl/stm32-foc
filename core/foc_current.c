@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    foc_current.c
  * @brief   dq 电流环一个控制周期的实现，说明见 foc_current.h

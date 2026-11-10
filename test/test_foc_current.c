@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    test_foc_current.c
  * @brief   dq 电流环一步计算（foc_current.c）的单元测试

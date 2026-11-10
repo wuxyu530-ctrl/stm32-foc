@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    test_foc_position.c
  * @brief   位置环（foc_position.c）的单元测试

@@ -70,3 +70,7 @@ tools/serial_capture.sh 30 COM27 921600    # 复位并采集串口输出
 ## 文档
 
 [电流环](docs/M7_电流闭环.md) · [机械参数辨识](docs/M8a_q轴电流测试.md) · [速度环](docs/M8b_速度环.md) · [位置环](docs/M9_位置环.md) · [六步换相](docs/M10_六步换相.md) · [理论笔记](docs/电流环控制基础.md)
+
+## 许可证
+
+自己编写的代码（core、test、sim、tools 以及 port 中的应用代码）以 [MIT](LICENSE) 许可证发布；STM32CubeMX 生成的代码和 HAL 库遵循 ST 原有的许可证。

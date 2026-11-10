@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    foc_types.h
  * @brief   FOC 算法库的基础类型与常量

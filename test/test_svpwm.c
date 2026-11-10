@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    test_svpwm.c
  * @brief   七段式 SVPWM 的单元测试

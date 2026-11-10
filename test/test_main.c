@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 #include <stdio.h>
 #include "test_framework.h"
 

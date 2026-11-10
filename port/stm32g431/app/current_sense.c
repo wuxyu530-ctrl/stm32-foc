@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    current_sense.c
  * @brief   三电阻低边电流采样实现，见 current_sense.h

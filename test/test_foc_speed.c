@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    test_foc_speed.c
  * @brief   速度环（foc_speed.c）的单元测试

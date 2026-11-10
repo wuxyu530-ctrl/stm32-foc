@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    foc_position.c
  * @brief   位置环实现，说明见 foc_position.h

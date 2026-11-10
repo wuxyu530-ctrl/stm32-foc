@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * @file    test_pi.c
  * @brief   离散 PI（前向欧拉 + 限幅 + 钳位抗饱和）的单元测试
