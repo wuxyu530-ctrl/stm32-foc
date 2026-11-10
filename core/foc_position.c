@@ -1,8 +1,6 @@
 /**
  * @file    foc_position.c
  * @brief   位置环实现，说明见 foc_position.h
- *
- * 【Claude 代写，待复核】
  */
 #include "foc_position.h"
 

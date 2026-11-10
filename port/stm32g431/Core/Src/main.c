@@ -57,7 +57,7 @@
 #define APP_M10_SIXSTEP    11  /* 六步换相（编码器模拟霍尔）：多档占空比测转速，抓三相电流波形，再用 FOC 同转速对比 */
 #define APP_MODE           APP_M9_POSITION
 
-/* ---- M7 电流闭环参数【Claude 代写，待复核】见 docs/M7_电流闭环.md ---- */
+/* ---- M7 电流闭环参数，见 docs/M7_电流闭环.md ---- */
 #define MOTOR_R            3.21f      /* 相电阻 [Ω]，M4b */
 #define MOTOR_L            0.88e-3f   /* 相电感 [H]，M4c */
 #define MOTOR_POLE_PAIRS   7          /* 极对数，M4a-2 实测 7.004 */
@@ -72,7 +72,7 @@
 #define M7_LEN             60         /* 共记录 60 个点（3 ms） */
 #define M7_REPEAT          64         /* 叠加次数：噪声降为 1/8 */
 
-/* ---- M8a q 轴电流测试参数【Claude 代写，待复核】 ---- */
+/* ---- M8a q 轴电流测试参数 ---- */
 #define M8_IQ_LIST         { 0.10f, 0.20f, 0.30f }   /* 依次测的 q 轴电流 [A]，id = 0 */
 #define M8_T_RUN_MS        800        /* 每次给 iq 的最长时间 [ms]（一般先碰到转速上限），之后 iq = 0 惯性滑行 */
 #define M8_T_COAST_MS      1000       /* 滑行记录时间 [ms] */
@@ -80,7 +80,7 @@
 #define M8_RPM_WIN         10         /* 转速 = 最近 10 次记录（约 10 ms）的位置差 / 时间差 */
 #define M8_RPM_MAX         1400.0f    /* 超过这个转速把 iq 置 0。run1 在 2350 rpm（vq 接近 v_max）时过流跳闸，先避开高调制区 */
 
-/* ---- M8b 速度环参数【Claude 代写，待复核】见 docs/M8b_速度环.md ---- */
+/* ---- M8b 速度环参数，见 docs/M8b_速度环.md ---- */
 #define RPM_TO_RADS        (FOC_2PI / 60.0f)
 #define M8B_KT_J           1.1e4f     /* Kt/J [rad/(s²·A)]，M8a 实测 */
 #define M8B_FC             50.0f      /* 速度环穿越频率 [Hz]：Kp = 2π·FC/(Kt/J)，Ki = Kp·2π·FC/4 */
@@ -95,7 +95,7 @@
 #define M8B_REPEAT         40         /* 叠加次数（10 次时噪声约 ±4.6 rpm，40 次约 ±2.3 rpm） */
 #define M8B_RPM_TRIP       1500.0f    /* 测得转速超过它立即停速度环、iq = 0（高调制区采样问题见 M8a 文档 §4） */
 
-/* ---- M9 位置环参数【Claude 代写，待复核】见 docs/M9_位置环.md ---- */
+/* ---- M9 位置环参数，见 docs/M9_位置环.md ---- */
 #define DEG2RAD            (FOC_PI / 180.0f)
 #define M9_FC              10.0f      /* 位置环穿越频率 [Hz]：Kp_pos = 2π·FC，约为速度环 50 Hz 的 1/5 */
 #define M9_W_MAX_RPM       300.0f     /* 位置环输出转速限幅 [rpm]：大阶跃时匀速走，速度环、电流环少饱和 */
@@ -107,7 +107,7 @@
 #define M9_REPEAT          10         /* 叠加次数 */
 #define M9_HOLD_S          15         /* 阶跃测试后保持在 0° 的秒数：这段时间可以用手轻推转子 */
 
-/* ---- M10 六步换相参数【Claude 代写，待复核】见 docs/M10_六步换相.md ---- */
+/* ---- M10 六步换相参数，见 docs/M10_六步换相.md ---- */
 #define M10_N_DUTY         5
 static const float M10_DUTY[M10_N_DUTY] = { 0.08f, 0.12f, 0.16f, 0.20f, 0.24f };   /* 导通相上管占空比 */
 #define M10_RPM_TRIP       1500.0f    /* 转速超过它立即停 */
@@ -191,7 +191,7 @@ static volatile uint32_t   g_step_n    = 0;         /* 当前在周期内的第�
 static volatile uint32_t   g_step_rep  = 0;         /* 已完成的重复次数 */
 static float               g_step_sum[M4C_LEN];     /* 每个采样点 id 的累加和 */
 
-/* ---- M7 电流闭环【Claude 代写，待复核】 ---- */
+/* ---- M7 电流闭环 ---- */
 static foc_cur_t           g_cur;                   /* dq 电流环（两个 PI + 限幅），只在中断里调用 step */
 static volatile uint32_t   g_enc_cnt0  = 0;         /* 对齐到 θe = 0 时的编码器计数，每次上电重新测 */
 static volatile float      g_id_ref    = 0.0f;      /* CTL_CURRENT 的 dq 电流目标 [A] */
@@ -205,7 +205,7 @@ static float               g_m7_id[M7_LEN];         /* 每个采样点 id 的累
 static float               g_m7_iq[M7_LEN];         /* iq 的累加和（应始终 ≈ 0） */
 static float               g_m7_vd[M7_LEN];         /* vd 指令的累加和（对照 Simulink 的电压台阶） */
 
-/* ---- M8b 速度环【Claude 代写，待复核】 ---- */
+/* ---- M8b 速度环 ---- */
 static foc_spd_t           g_spd;                   /* 测速 + 速度 PI，只在中断里调用 step */
 static volatile int        g_spd_on    = 0;         /* 1：中断里每 M8B_DIV 个周期跑一次速度环，写 g_iq_ref */
 static volatile int        g_spd_trip  = 0;         /* 超速保护动作后置 1 */
@@ -219,7 +219,7 @@ static float               g_m8b_iqr[M8B_LEN];      /* iq_ref 的累加和 [A] *
 static float               g_m8b_iq[M8B_LEN];       /* 实测 iq 的累加和 [A] */
 
 #if APP_MODE == APP_M9_POSITION
-/* ---- M9 位置环【Claude 代写，待复核】 ---- */
+/* ---- M9 位置环 ---- */
 static foc_pos_t           g_pos;
 static volatile int        g_pos_on    = 0;         /* 1：速度环的 ω_ref 由位置环给 */
 static volatile float      g_theta_ref = 0.0f;      /* 目标位置 [rad，机械角，相对位置环 reset 时刻] */
@@ -232,7 +232,7 @@ static float               g_m9_iqr[M9_LEN];        /* iq_ref 的累加和 [A] *
 #endif
 
 #if APP_MODE == APP_M10_SIXSTEP
-/* ---- M10 六步换相【Claude 代写，待复核】 ---- */
+/* ---- M10 六步换相 ---- */
 static volatile float      g_6s_duty   = 0.0f;      /* 导通相上管占空比 */
 static volatile int        g_6s_sector = -1;
 static volatile float      g_6s_iq_sum = 0.0f;      /* 主循环清零，中断累加，用来算平均 iq */
@@ -324,7 +324,7 @@ static void pwm_start_zero(void)
     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
 }
 
-/* 由编码器计数算电角度 θe ∈ [0, 2π)【Claude 代写，待复核】
+/* 由编码器计数算电角度 θe ∈ [0, 2π)
  *   θe = 2π · frac( ENC_DIR · 极对数 · (cnt − cnt0) / 4096 )
  * cnt0 是对齐到 θe = 0 时的计数；frac() 取小数部分，把多圈电角度折回一圈。 */
 static float theta_e_from_encoder(void)
@@ -336,7 +336,7 @@ static float theta_e_from_encoder(void)
 }
 
 #if APP_MODE == APP_M10_SIXSTEP
-/* ---- 六步换相【Claude 代写，待复核】见 docs/M10_六步换相.md ----
+/* ---- 六步换相，见 docs/M10_六步换相.md ----
  * 扇区 s 由电角度决定：s = floor((θe + 30°) / 60°)，s = 0 对应 θe ∈ [−30°, 30°)。
  * 每个扇区选一个超前转子 60°～120° 的电流方向：一相上管 PWM（"进"）、一相下管常开（"出"）、一相悬空。
  *   s : 0    1    2    3    4    5
@@ -489,7 +489,7 @@ void cs_on_sample(const foc_abc_t *i)
       apply_udq(g_ctl_ud, g_ctl_uq, th);
       break;
     }
-    case CTL_CURRENT: {                              /* M7 电流闭环【Claude 代写，待复核】 */
+    case CTL_CURRENT: {                              /* M7 电流闭环 */
       float th = theta_e_from_encoder();
       g_theta_e = th;
       foc_sincos_t sc;
@@ -501,7 +501,7 @@ void cs_on_sample(const foc_abc_t *i)
       if (g_m7_run) id_ref = (n < M7_STEP_AT) ? M7_ID_LO : M7_ID_HI;
 
 #if APP_MODE == APP_M8B_SPEED || APP_MODE == APP_M9_POSITION || APP_MODE == APP_M10_SIXSTEP
-      /* 速度环【Claude 代写，待复核】：每 M8B_DIV 个周期一次，算出 iq_ref 交给本周期的电流环。
+      /* 速度环：每 M8B_DIV 个周期一次，算出 iq_ref 交给本周期的电流环。
        * M9：ω_ref 由位置环给（位置环和速度环同为 1 kHz，读同一个编码器计数） */
       if (g_spd_on && ++g_spd_div >= M8B_DIV) {
         g_spd_div = 0;
@@ -566,7 +566,7 @@ void cs_on_sample(const foc_abc_t *i)
       break;
     }
 #if APP_MODE == APP_M10_SIXSTEP
-    case CTL_SIXSTEP: {                              /* M10 六步换相【Claude 代写，待复核】 */
+    case CTL_SIXSTEP: {                              /* M10 六步换相 */
       float th = theta_e_from_encoder();
       g_theta_e = th;
       int s = (int)((th + FOC_PI / 6.0f) / (FOC_PI / 3.0f));   /* θe ∈ [0, 2π) → 0..6，6 即 0 */
@@ -859,7 +859,7 @@ int main(void)
 
 #elif APP_MODE == APP_M7_CURRENT || APP_MODE == APP_M8A_IQ_SPIN || APP_MODE == APP_M8B_SPEED || \
       APP_MODE == APP_M9_POSITION || APP_MODE == APP_M10_SIXSTEP
-  /* 【Claude 代写，待复核】流程与预期结果见 docs/M7_电流闭环.md。M8a、M8b、M9、M10 共用 ①～④，从 ⑤ 开始不同 */
+  /* 流程与预期结果见 docs/M7_电流闭环.md。M8a、M8b、M9、M10 共用 ①～④，从 ⑤ 开始不同 */
   {
     const float wbw = FOC_2PI * M7_FBW;
     const float kp  = MOTOR_L * wbw;               /* ≈ 5.53 V/A */
@@ -944,7 +944,7 @@ int main(void)
            (double)g_cur_out.vd, (double)g_cur_out.vq, (double)g_cur.v_max);
 
 #if APP_MODE == APP_M8A_IQ_SPIN
-    /* ⑤ q 轴电流测试【Claude 代写，待复核】
+    /* ⑤ q 轴电流测试
      *    id = 0、iq = 常数：电流矢量始终超前转子 90°，电机加速；M8_T_RUN_MS 后 iq = 0，
      *    电流环仍在运行（id = iq = 0，不产生转矩也不刹车），电机靠惯性滑行、被摩擦减速。
      *    转速：主循环每 1 ms 读一次编码器展开成累计位置 g_enc_pos，取约 10 ms 的位置差。
@@ -996,7 +996,7 @@ int main(void)
     if (g_fault) printf("!! OVERCURRENT TRIP\r\n");
     else         printf("---- END ----\r\n");
 #elif APP_MODE == APP_M8B_SPEED
-    /* ⑤ 速度环【Claude 代写，待复核】
+    /* ⑤ 速度环
      *    a. 从静止启动到 600 rpm（开始会饱和在 iq_max），稳定 1 s，期间每 100 ms 打印一次
      *    b. 目标 600 ↔ 700 rpm 每 200 ms 切换，按"相对阶跃时刻的位置"叠加记录 M8B_REPEAT 次
      *    c. 停速度环、iq = 0 惯性滑行 1.5 s（电流环仍运行，不出力也不刹车），再回零矢量 */
@@ -1041,7 +1041,7 @@ int main(void)
       printf("---- END ----\r\n");
     }
 #elif APP_MODE == APP_M9_POSITION
-    /* ⑤ 位置环【Claude 代写，待复核】见 docs/M9_位置环.md
+    /* ⑤ 位置环，见 docs/M9_位置环.md
      *    a. 位置环 + 速度环接管，以当前位置为 0°，保持 0.5 s
      *    b. 目标 0 ↔ 90° 每 500 ms 切换，按"相对阶跃时刻的位置"叠加记录 M9_REPEAT 次
      *    c. 保持在 0° 共 M9_HOLD_S 秒，每 100 ms 打印位置误差和 iq_ref：这段时间可用手轻推转子
@@ -1099,7 +1099,7 @@ int main(void)
       printf("---- END ----\r\n");
     }
 #elif APP_MODE == APP_M10_SIXSTEP
-    /* ⑤ 六步换相【Claude 代写，待复核】见 docs/M10_六步换相.md
+    /* ⑤ 六步换相，见 docs/M10_六步换相.md
      *    a. 切到六步换相（扇区由编码器电角度决定），占空比逐档加大，每档测平均转速和平均 iq
      *    b. 最后一档抓 40 ms 三相电流波形
      *    c. 无缝切到 FOC 速度环，目标 = 六步测得的转速（预置 vq = 反电动势，避免切换时电流冲击），

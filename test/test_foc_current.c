@@ -2,8 +2,6 @@
  * @file    test_foc_current.c
  * @brief   dq 电流环一步计算（foc_current.c）的单元测试
  *
- * 【Claude 代写，待复核】
- *
  * 重点是最后一组：把电机看成 d、q 两个独立的 RL（转子不转、无反电动势、无耦合），
  * 在任意电角度下做 d 轴 0 → 1 A 阶跃，结果必须与 test_pi.c 的单轴闭环、
  * 以及 Simulink sim/current_loop_dt.slx 完全一致 —— 这同时验证了

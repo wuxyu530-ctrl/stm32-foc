@@ -1,8 +1,6 @@
 /**
  * @file    foc_speed.c
  * @brief   速度环实现，说明见 foc_speed.h
- *
- * 【Claude 代写，待复核】
  */
 #include "foc_speed.h"
 

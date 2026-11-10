@@ -1,8 +1,6 @@
 /**
  * @file    foc_current.c
  * @brief   dq 电流环一个控制周期的实现，说明见 foc_current.h
- *
- * 【Claude 代写，待复核】
  */
 #include "foc_current.h"
 #include "transform.h"

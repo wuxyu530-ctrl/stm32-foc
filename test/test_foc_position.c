@@ -2,8 +2,6 @@
  * @file    test_foc_position.c
  * @brief   位置环（foc_position.c）的单元测试
  *
- * 【Claude 代写，待复核】
- *
  * 闭环测试：位置 P → 速度 PI（foc_speed）→ 电流环（一阶滞后）→ 机械模型（M8a 实测参数）→ 编码器量化，
  * 位置环和速度环都是 1 kHz，与 main.c 的 APP_M9_POSITION 一致。
  */

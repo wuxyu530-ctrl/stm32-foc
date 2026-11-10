@@ -2,8 +2,6 @@
  * @file    test_foc_speed.c
  * @brief   速度环（foc_speed.c）的单元测试
  *
- * 【Claude 代写，待复核】
- *
  * 闭环测试里的电机模型用 M8a 实测参数（docs/M8a_q轴电流测试.md）：
  *   J·dω/dt = Kt·iq − B·ω − Tc·sign(ω)，Kt/J = 1.1e4，B/J = 0.97 /s，Tc/J = 183 rad/s²
  *   电流环看成一阶滞后，时间常数 1/(2π·1000 Hz)
